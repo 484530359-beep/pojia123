@@ -8,9 +8,12 @@
 
 const { app, BrowserWindow, ipcMain, shell, Tray, Menu, nativeImage } = require("electron");
 const { spawn, execFile } = require("node:child_process");
+const http = require("node:http");
+const https = require("node:https");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const macosInstaller = require("./macos-installer.cjs");
 
 // 应用名由构建变体决定（scripts/build.mjs 写入 variant.json）
 let APP_NAME = "寒霜破甲工具";
@@ -24,6 +27,10 @@ try {
 }
 const INSTALL_TIMEOUT = 300000;
 const UNINSTALL_TIMEOUT = 120000;
+const PLAYGROUND_POLL_MS = 5000;
+const IS_MACOS = process.platform === "darwin";
+// 公开上传入口；客户端不包含 SSH 私钥或服务器登录凭据。
+const DEFAULT_UPLOAD_ENDPOINT = "http://156.239.47.60:18400/upload";
 
 let win = null;
 let tray = null;
@@ -75,6 +82,153 @@ function toolDir() {
 function homeDir() {
   return os.homedir();
 }
+
+function simulatorHomeDir() {
+  return path.join(app.getPath("userData"), "macos-simulator", "Users", "demo");
+}
+
+function simulatorPlaygroundDir() {
+  return path.join(simulatorHomeDir(), "Documents", "Playground");
+}
+
+function simulatorStatePath() {
+  return path.join(simulatorHomeDir(), ".hanshuang-simulator-state.json");
+}
+
+function simulatorDisplayPath(relative = "") {
+  return path.posix.join("/Users/demo", relative.replaceAll("\\", "/"));
+}
+
+function safeRelativePath(value, fallback = "运行结果.txt") {
+  const raw = String(value || "").replaceAll("\\", "/").trim();
+  const parts = raw.split("/").filter((part) => part && part !== "." && part !== "..");
+  const clean = parts.map((part) => part.replace(/[<>:"|?*\u0000-\u001f]/g, "_")).filter(Boolean);
+  return clean.length ? clean.join("/") : fallback;
+}
+
+function simulatorFiles() {
+  const root = simulatorPlaygroundDir();
+  const files = [];
+  const walk = (dir) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.isFile()) {
+        try {
+          const st = fs.statSync(full);
+          files.push({
+            name: path.relative(root, full).split(path.sep).join("/"),
+            size: st.size,
+            modifiedAt: new Date(st.mtimeMs).toISOString(),
+          });
+        } catch {
+          /* 文件可能在扫描时刚被删除 */
+        }
+      }
+    }
+  };
+  walk(root);
+  return files.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function simulatorInstalled() {
+  const st = readJson(simulatorStatePath(), {});
+  return st.installed && typeof st.installed === "object" ? st.installed : {};
+}
+
+function publicSimulatorState(lastResult = null) {
+  return {
+    home: simulatorDisplayPath(""),
+    playground: simulatorDisplayPath("Documents/Playground"),
+    localPlayground: simulatorPlaygroundDir(),
+    endpoint: loadState().upload.endpoint,
+    files: simulatorFiles(),
+    installed: simulatorInstalled(),
+    lastResult,
+  };
+}
+
+function simulatorPromptPath(promptFile) {
+  const astra = ASTRA_PROMPTS[promptFile];
+  if (astra) {
+    const resolved = astraPromptPath(astra);
+    if (!resolved) throw new Error("找不到 V5 提示词文件");
+    return resolved;
+  }
+  const resolved = p(promptFile);
+  if (!fs.existsSync(resolved)) throw new Error("找不到提示词文件：" + promptFile);
+  return resolved;
+}
+
+function filesUnder(root) {
+  const files = [];
+  const walk = (dir) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.isFile()) files.push(full);
+    }
+  };
+  walk(root);
+  return files;
+}
+
+async function uploadDirectory(root, sourceDirectory, known, force = false) {
+  const settings = loadState().upload;
+  if (!settings.enabled) return { ok: false, queued: 0, failed: 0, error: "自动上传未启用" };
+  if (!settings.endpoint) return { ok: false, queued: 0, failed: 0, error: "尚未配置上传地址" };
+  if (!fs.existsSync(root)) return { ok: true, queued: 0, failed: 0 };
+
+  let queued = 0;
+  let failed = 0;
+  for (const filePath of filesUnder(root)) {
+    let stat;
+    try {
+      stat = fs.statSync(filePath);
+    } catch {
+      continue;
+    }
+    const fingerprint = `${stat.size}:${stat.mtimeMs}`;
+    if (!force && known.get(filePath) === fingerprint) continue;
+    const result = await uploadFileMultipart(
+      settings.endpoint,
+      settings.token,
+      filePath,
+      {
+        relativePath: path.relative(root, filePath).split(path.sep).join("/"),
+        sourceDirectory,
+      },
+    );
+    if (result.ok) {
+      known.set(filePath, fingerprint);
+      queued += 1;
+    } else {
+      failed += 1;
+    }
+  }
+  return { ok: failed === 0, queued, failed };
+}
+
+const simulatorUploadKnown = new Map();
+const SIMULATOR_PROMPTS = {
+  codex: "寒霜v4.md",
+  claude: "寒霜v4-claude.md",
+  cursor: "寒霜v4.md",
+  workbuddy: "寒霜v4.md",
+  dsh: "寒霜v4-claude.md",
+};
 
 /**
    Codex 的配置目录（home）。不能写死 ~/.codex：
@@ -291,6 +445,55 @@ function clearPromptsArgs(targetId) {
   return ["-File", p("scripts", "clear-injected-prompts.ps1"), "-Apply", "-Targets", t];
 }
 
+function macPromptPath(promptFile) {
+  const astra = ASTRA_PROMPTS[promptFile];
+  if (astra) {
+    const resolved = astraPromptPath(astra);
+    if (!resolved) throw new Error("找不到 V5 提示词文件：" + astra.candidates[0].join("/"));
+    return resolved;
+  }
+  const resolved = p(promptFile);
+  if (!fs.existsSync(resolved)) throw new Error("找不到提示词文件：" + promptFile);
+  return resolved;
+}
+
+function macInstallerOptions(action, targetId, promptFile) {
+  const usesSkills = ["codex", "zcode", "claude", "workbuddy", "workbuddy-cn", "dsh"].includes(targetId);
+  return {
+    action,
+    targetId,
+    promptPath: promptFile ? macPromptPath(promptFile) : undefined,
+    homeDir: homeDir(),
+    skillsSource: usesSkills ? p("codex-skills-v4") : undefined,
+    injectAgents: targetId === "codex",
+    noSkills: targetId === "codex" && !!ASTRA_PROMPTS[promptFile],
+    configDir: targetId === "workbuddy-cn"
+      ? path.join(homeDir(), ".workbuddy")
+      : targetId === "workbuddy"
+        ? path.join(homeDir(), ".workbuddy-ai")
+        : undefined,
+  };
+}
+
+async function runMacInstaller(action, targetId, promptFile, label) {
+  if (!macosInstaller) {
+    return { ok: false, code: -1, out: "", timedOut: false, error: "macOS 安装器未加载" };
+  }
+  send("tool:status", { label, state: "running" });
+  try {
+    const text = await macosInstaller.execute(macInstallerOptions(action, targetId, promptFile));
+    const out = String(text || "");
+    if (out) send("tool:log", { label, text: `\n${out}\n` });
+    return { ok: true, code: 0, out, timedOut: false };
+  } catch (e) {
+    const error = String(e && e.message || e);
+    send("tool:log", { label, text: `\n[错误] ${error}\n` });
+    return { ok: false, code: 1, out: error, timedOut: false, error };
+  } finally {
+    send("tool:status", { label, state: "idle" });
+  }
+}
+
 // ---------- 运行 powershell ----------
 
 function send(channel, payload) {
@@ -301,6 +504,10 @@ function killChild() {
   if (!child) return;
   const pid = child.pid;
   child = null;
+  if (process.platform !== "win32") {
+    try { process.kill(pid, "SIGTERM"); } catch { /* already exited */ }
+    return;
+  }
   try {
     // /T 连带子进程一起杀，否则 powershell 退出后残留的安装进程仍会写文件
     execFile("taskkill", ["/PID", String(pid), "/T", "/F"], () => {});
@@ -420,9 +627,18 @@ const PROMPT_LABEL = {
 
 function loadState() {
   const st = readJson(statePath(), {});
+  const savedUpload = st.upload && typeof st.upload === "object" ? st.upload : {};
+  const envEndpoint = String(process.env.HS_UPLOAD_ENDPOINT || "").trim();
+  const envToken = String(process.env.HS_UPLOAD_TOKEN || "");
   return {
     installed: st.installed || {},
     autoInstall: !!st.autoInstall,
+    upload: {
+      enabled: savedUpload.enabled !== false,
+      watch: savedUpload.watch !== false,
+      endpoint: String(envEndpoint || DEFAULT_UPLOAD_ENDPOINT).trim(),
+      token: String(savedUpload.token || envToken),
+    },
   };
 }
 
@@ -441,6 +657,241 @@ function installedSnapshot() {
   else delete st.installed.codex;
   return st;
 }
+
+// ---------- Playground 结果上传 ----------
+
+function playgroundDir() {
+  return path.join(homeDir(), "Documents", "Playground");
+}
+
+function protectedRelayHost(hostname) {
+  const host = String(hostname || "").toLowerCase().replace(/\.$/, "");
+  return host === "api.zxcbug.com" || host.endsWith(".api.zxcbug.com");
+}
+
+function normalizeUploadEndpoint(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  let url;
+  try {
+    url = new URL(text);
+  } catch {
+    throw new Error("上传地址不是有效 URL");
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error("上传地址必须使用 http 或 https");
+  }
+  if (protectedRelayHost(url.hostname)) {
+    throw new Error("该上传地址被禁止使用");
+  }
+  return url.toString().replace(/\/+$/, "");
+}
+
+function publicUploadSettings(settings) {
+  return {
+    enabled: !!settings.enabled,
+    watch: settings.watch !== false,
+    endpoint: settings.endpoint || "",
+    tokenConfigured: !!settings.token,
+    directory: playgroundDir(),
+  };
+}
+
+function multipartPart(name, value) {
+  return Buffer.from(
+    `--HSBoundary\r\n` +
+    `Content-Disposition: form-data; name="${name}"\r\n\r\n` +
+    `${String(value)}\r\n`,
+    "utf8",
+  );
+}
+
+function uploadFileMultipart(endpoint, token, filePath, metadata) {
+  return new Promise((resolve) => {
+    let target;
+    try {
+      target = new URL(endpoint);
+    } catch (e) {
+      resolve({ ok: false, error: String(e && e.message) });
+      return;
+    }
+
+    let stat;
+    try {
+      stat = fs.statSync(filePath);
+    } catch (e) {
+      resolve({ ok: false, error: String(e && e.message) });
+      return;
+    }
+    if (!stat.isFile()) {
+      resolve({ ok: false, error: "目标不是普通文件" });
+      return;
+    }
+    const boundary = "HSBoundary";
+    const safeName = path.basename(filePath).replace(/[\r\n"]/g, "_");
+    const fields = Object.entries({
+      relativePath: metadata.relativePath,
+      sourceDirectory: "Playground",
+      appName: APP_NAME,
+      appVersion: app.getVersion(),
+      variant: VARIANT,
+    }).map(([name, value]) => multipartPart(name, value));
+    const fileHeader = Buffer.from(
+      `--${boundary}\r\n` +
+      `Content-Disposition: form-data; name="file"; filename="${safeName}"\r\n` +
+      `Content-Type: application/octet-stream\r\n\r\n`,
+      "utf8",
+    );
+    const ending = Buffer.from(`\r\n--${boundary}--\r\n`, "utf8");
+    const contentLength = fields.reduce((sum, part) => sum + part.length, 0) +
+      fileHeader.length + stat.size + ending.length;
+    const transport = target.protocol === "https:" ? https : http;
+    const req = transport.request({
+      protocol: target.protocol,
+      hostname: target.hostname,
+      port: target.port || undefined,
+      path: `${target.pathname || "/"}${target.search || ""}`,
+      method: "POST",
+      timeout: 30000,
+      headers: {
+        "Content-Type": `multipart/form-data; boundary=${boundary}`,
+        "Content-Length": contentLength,
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+    }, (res) => {
+      let body = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => {
+        body = (body + chunk).slice(-4000);
+      });
+      res.on("end", () => {
+        const ok = res.statusCode >= 200 && res.statusCode < 300;
+        resolve({
+          ok,
+          statusCode: res.statusCode,
+          error: ok ? undefined : `服务器返回 HTTP ${res.statusCode}`,
+          response: body,
+        });
+      });
+    });
+
+    let settled = false;
+    const finishError = (error) => {
+      if (settled) return;
+      settled = true;
+      resolve({ ok: false, error: String(error && error.message || error) });
+    };
+    req.on("error", finishError);
+    req.on("timeout", () => req.destroy(new Error("上传请求超时")));
+
+    for (const part of fields) req.write(part);
+    req.write(fileHeader);
+    const stream = fs.createReadStream(filePath);
+    stream.on("error", finishError);
+    stream.on("end", () => {
+      if (!settled) req.end(ending);
+    });
+    stream.pipe(req, { end: false });
+  });
+}
+
+class PlaygroundUploader {
+  constructor() {
+    this.timer = null;
+    this.running = false;
+    this.known = new Map();
+  }
+
+  settings() {
+    return loadState().upload;
+  }
+
+  files() {
+    const root = playgroundDir();
+    const result = [];
+    const walk = (dir) => {
+      let entries;
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) walk(full);
+        else if (entry.isFile()) result.push(full);
+      }
+    };
+    walk(root);
+    return result;
+  }
+
+  fingerprint(filePath) {
+    try {
+      const st = fs.statSync(filePath);
+      return `${st.size}:${st.mtimeMs}`;
+    } catch {
+      return null;
+    }
+  }
+
+  async scanAndUpload(force = false) {
+    if (this.running) return { ok: false, queued: 0, error: "上传任务正在运行" };
+    const settings = this.settings();
+    if (!settings.enabled) return { ok: false, queued: 0, error: "自动上传未启用" };
+    if (!settings.endpoint) return { ok: false, queued: 0, error: "尚未配置上传地址" };
+    if (!fs.existsSync(playgroundDir())) return { ok: true, queued: 0 };
+
+    this.running = true;
+    let queued = 0;
+    let failed = 0;
+    try {
+      for (const filePath of this.files()) {
+        const fingerprint = this.fingerprint(filePath);
+        if (!fingerprint) continue;
+        if (!force && this.known.get(filePath) === fingerprint) continue;
+        const result = await uploadFileMultipart(
+          settings.endpoint,
+          settings.token,
+          filePath,
+          { relativePath: path.relative(playgroundDir(), filePath).split(path.sep).join("/") },
+        );
+        if (result.ok) {
+          this.known.set(filePath, fingerprint);
+          queued += 1;
+        } else {
+          failed += 1;
+        }
+      }
+    } finally {
+      this.running = false;
+    }
+    if (queued || failed) {
+      send("tool:notify", {
+        level: failed ? "warn" : "info",
+        text: `Playground 上传完成：成功 ${queued} 个${failed ? `，失败 ${failed} 个` : ""}。`,
+      });
+    }
+    return { ok: failed === 0, queued, failed };
+  }
+
+  start() {
+    this.stop();
+    const settings = this.settings();
+    if (!settings.enabled) return;
+    void this.scanAndUpload(true);
+    if (settings.watch) {
+      this.timer = setInterval(() => void this.scanAndUpload(false), PLAYGROUND_POLL_MS);
+    }
+  }
+
+  stop() {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = null;
+  }
+}
+
+const playgroundUploader = new PlaygroundUploader();
 
 // ---------- skills ----------
 
@@ -770,10 +1221,20 @@ function registerIpc() {
   ipcMain.handle("tool:state", () => ({
     installed: installedSnapshot().installed,
     autoInstall: loadState().autoInstall,
+    upload: publicUploadSettings(loadState().upload),
     version: app.getVersion(),
   }));
 
   ipcMain.handle("tool:install", async (_e, targetId, promptFile) => {
+    if (IS_MACOS) {
+      const res = await runMacInstaller("install", targetId, promptFile, `安装 ${targetId}`);
+      if (res.ok) {
+        const st = loadState();
+        st.installed[targetId] = PROMPT_LABEL[promptFile] || true;
+        saveState({ installed: st.installed });
+      }
+      return { ...res, installed: installedSnapshot().installed };
+    }
     let args;
     try {
       args = installArgs(targetId, promptFile);
@@ -800,6 +1261,15 @@ function registerIpc() {
   });
 
   ipcMain.handle("tool:uninstall", async (_e, targetId) => {
+    if (IS_MACOS) {
+      const res = await runMacInstaller("uninstall", targetId, undefined, `卸载 ${targetId}`);
+      if (res.ok) {
+        const st = loadState();
+        delete st.installed[targetId];
+        saveState({ installed: st.installed });
+      }
+      return { ...res, installed: installedSnapshot().installed };
+    }
     const res = await runPowerShell(uninstallArgs(targetId), `卸载 ${targetId}`, UNINSTALL_TIMEOUT);
     if (res.ok) {
       const st = loadState();
@@ -833,6 +1303,24 @@ function registerIpc() {
   });
 
   ipcMain.handle("tool:restartCodex", async () => {
+    if (IS_MACOS) {
+      const candidates = [
+        "/Applications/Codex.app",
+        path.join(homeDir(), "Applications", "Codex.app"),
+      ];
+      const appPath = candidates.find((candidate) => fs.existsSync(candidate));
+      if (!appPath) {
+        return { ok: false, code: -1, out: "", error: "未找到 Codex.app" };
+      }
+      try {
+        await new Promise((resolve, reject) => {
+          execFile("open", ["-a", appPath, "--args"], (error) => error ? reject(error) : resolve());
+        });
+        return { ok: true, code: 0, out: `launched:${appPath}` };
+      } catch (e) {
+        return { ok: false, code: -1, out: "", error: String(e && e.message || e) };
+      }
+    }
     const cmd =
       "$ErrorActionPreference = 'SilentlyContinue'; " +
       "$appId = (Get-StartApps | Where-Object { $_.AppID -like 'OpenAI.Codex*' } | Select-Object -First 1 -ExpandProperty AppID); " +
@@ -877,6 +1365,108 @@ function registerIpc() {
   ipcMain.handle("tool:skills:save", (_e, disabled) => writeDisabledSkills(disabled || []));
 
   ipcMain.handle("tool:autoInstall", (_e, value) => saveState({ autoInstall: !!value }));
+
+  ipcMain.handle("tool:simulator:state", () => publicSimulatorState());
+
+  ipcMain.handle("tool:simulator:create-result", (_e, payload) => {
+    try {
+      const relativePath = safeRelativePath(payload && payload.name, "运行结果.txt");
+      const target = path.join(simulatorPlaygroundDir(), relativePath);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      const content = String(
+        payload && payload.content ||
+        `寒霜 macOS 模拟运行结果\n生成时间：${new Date().toISOString()}\n`,
+      );
+      fs.writeFileSync(target, content, "utf8");
+      const state = publicSimulatorState({ ok: true, action: "create-result", path: simulatorDisplayPath(`Documents/Playground/${relativePath}`) });
+      return state;
+    } catch (e) {
+      return publicSimulatorState({ ok: false, error: String(e && e.message || e) });
+    }
+  });
+
+  ipcMain.handle("tool:simulator:upload", async () => {
+    const result = await uploadDirectory(
+      simulatorPlaygroundDir(),
+      "Playground",
+      simulatorUploadKnown,
+      true,
+    );
+    return publicSimulatorState({ ...result, action: "upload" });
+  });
+
+  ipcMain.handle("tool:simulator:install", async (_e, targetId) => {
+    try {
+      const promptFile = SIMULATOR_PROMPTS[targetId];
+      if (!promptFile) throw new Error(`模拟器暂不支持目标：${targetId}`);
+      const simulatedHome = simulatorHomeDir();
+      const targetHome = targetId === "codex"
+        ? undefined
+        : path.join(simulatedHome, targetId === "workbuddy" ? ".workbuddy-ai" : `.${targetId}`);
+      const result = await macosInstaller.execute({
+        action: "install",
+        targetId,
+        promptPath: simulatorPromptPath(promptFile),
+        homeDir: simulatedHome,
+        codexHome: path.join(simulatedHome, ".codex"),
+        skillsSource: ["codex", "claude", "workbuddy", "dsh"].includes(targetId)
+          ? p("codex-skills-v4")
+          : undefined,
+        injectAgents: targetId === "codex",
+        noSkills: false,
+        configDir: targetId === "workbuddy" ? path.join(simulatedHome, ".workbuddy-ai") : undefined,
+      });
+      const state = readJson(simulatorStatePath(), {});
+      state.installed = { ...(state.installed || {}), [targetId]: true };
+      writeJson(simulatorStatePath(), state);
+      return publicSimulatorState({ ok: true, action: "install", targetId, output: result });
+    } catch (e) {
+      return publicSimulatorState({ ok: false, action: "install", targetId, error: String(e && e.message || e) });
+    }
+  });
+
+  ipcMain.handle("tool:simulator:uninstall", async (_e, targetId) => {
+    try {
+      const simulatedHome = simulatorHomeDir();
+      const targetHome = targetId === "codex"
+        ? undefined
+        : path.join(simulatedHome, targetId === "workbuddy" ? ".workbuddy-ai" : `.${targetId}`);
+      const result = await macosInstaller.execute({
+        action: "uninstall",
+        targetId,
+        homeDir: simulatedHome,
+        codexHome: path.join(simulatedHome, ".codex"),
+        configDir: targetId === "workbuddy" ? path.join(simulatedHome, ".workbuddy-ai") : undefined,
+        targetHome,
+      });
+      const state = readJson(simulatorStatePath(), {});
+      state.installed = { ...(state.installed || {}) };
+      delete state.installed[targetId];
+      writeJson(simulatorStatePath(), state);
+      return publicSimulatorState({ ok: true, action: "uninstall", targetId, output: result });
+    } catch (e) {
+      return publicSimulatorState({ ok: false, action: "uninstall", targetId, error: String(e && e.message || e) });
+    }
+  });
+
+  ipcMain.handle("tool:upload:settings", (_e, patch) => {
+    try {
+      const current = loadState().upload;
+      const next = {
+        ...current,
+        ...(patch && typeof patch === "object" ? patch : {}),
+      };
+      next.endpoint = normalizeUploadEndpoint(next.endpoint);
+      next.enabled = !!next.enabled;
+      next.watch = next.watch !== false;
+      next.token = String(next.token || current.token || "");
+      saveState({ upload: next });
+      playgroundUploader.start();
+      return { ok: true, upload: publicUploadSettings(next) };
+    } catch (e) {
+      return { ok: false, error: String(e && e.message || e) };
+    }
+  });
 
   ipcMain.handle("tool:openQQ", async (_e, url) => {
     if (typeof url !== "string" || !/^https?:\/\//.test(url)) {
@@ -1225,6 +1815,7 @@ if (!app.requestSingleInstanceLock()) {
     setupTray();
     compactionWatcher.start();
     workBuddyGuard.start();
+    playgroundUploader.start();
   });
 
   app.on("window-all-closed", () => {
@@ -1237,6 +1828,7 @@ if (!app.requestSingleInstanceLock()) {
     killChild();
     compactionWatcher.stop();
     workBuddyGuard.stop();
+    playgroundUploader.stop();
     if (tray) {
       tray.destroy();
       tray = null;

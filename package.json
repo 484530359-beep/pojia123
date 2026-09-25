@@ -9,7 +9,8 @@
     "dev:electron": "electron .",
     "build": "vite build",
     "start": "npm run build && electron .",
-    "dist": "node scripts/build.mjs"
+    "dist": "node scripts/build.mjs",
+    "dist:mac": "node scripts/build.mjs --mac"
   },
   "dependencies": {
     "lucide-react": "^1.45.0",
@@ -148,6 +149,27 @@
       ],
       "icon": "build/icon.png",
       "signAndEditExecutable": false
+    },
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "category": "public.app-category.utilities",
+      "icon": "build/icon.png",
+      "artifactName": "寒霜破甲工具-mac-${version}-${arch}.${ext}"
     },
     "portable": {
       "artifactName": "寒霜破甲工具-免安装版-${version}.${ext}"

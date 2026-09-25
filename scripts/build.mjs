@@ -20,8 +20,11 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const appDir = join(dirname(fileURLToPath(import.meta.url)), "..");
+const cliArgs = process.argv.slice(2);
+const buildMac = cliArgs.includes("--mac") || process.env.HS_BUILD_PLATFORM === "mac";
 // 独立项目：不带参数时直接读 variant.json，本文件夹只产出自己那个变体
-const variant = process.argv[2] ||
+const variantArg = cliArgs.find((arg) => arg === "free" || arg === "pro");
+const variant = variantArg ||
   JSON.parse(readFileSync(join(appDir, "variant.json"), "utf8")).variant;
 
 /** 界面左上角与个人中心展示的版本号（与安装包文件名的版本无关）。 */
@@ -90,10 +93,10 @@ const buildCfg = {
   ...base,
   appId: cfg.appId,
   productName: cfg.appName,
-  // 不在这里统设 artifactName：那会把 nsis / portable 两个目标压成同一个
-  // 文件名互相覆盖。各自的命名写在 package.json 的 nsis / portable 段里。
+  // 不在这里统设 artifactName：各平台的命名写在 package.json 对应段里。
   directories: { ...(base.directories || {}), output: cfg.output },
-  // 打完应用目录、生成安装器之前跑：用 rcedit 写 exe 图标与版本信息
+  // 打完应用目录、生成安装器之前跑：Windows 用 rcedit 写 exe 图标与版本信息；
+  // macOS 下 after-pack 会自动跳过。
   afterPack: "scripts/after-pack.js",
   win: { ...(base.win || {}), icon: cfg.icon },
   nsis: {
@@ -107,37 +110,48 @@ const cfgFile = join(appDir, `.electron-builder.${variant}.json`);
 writeFileSync(cfgFile, JSON.stringify(buildCfg, null, 2) + "\n", "utf8");
 
 try {
-  run(["electron-builder", "--win", "--publish", "never", "--config", cfgFile]);
+  run([
+    "electron-builder",
+    buildMac ? "--mac" : "--win",
+    "--publish",
+    "never",
+    "--config",
+    cfgFile,
+  ]);
 } finally {
   rmSync(cfgFile, { force: true });
 }
 
-// 4) 便携版 zip：把解压好的应用目录直接压成 zip。
+// 4) Windows 便携版 zip：把解压好的应用目录直接压成 zip。
 // 为什么要这个：electron-builder 的 "portable" 目标每次启动都要把 ~110MB 自解压到临时
 // 目录（还要被杀软扫一遍），实测开窗要 2 分钟；而解压好的目录直接跑只要 2 秒。
 // zip 内不带顶层目录，用户解压到哪就能在哪双击运行。
 try {
-  const pkgVer = JSON.parse(readFileSync(join(appDir, "package.json"), "utf8")).version;
-  const zipName = `${cfg.appName}-便携版-${pkgVer}.zip`;
-  const zipPath = join(appDir, cfg.output, zipName);
-  rmSync(zipPath, { force: true });
-  execFileSync(
-    "python",
-    [
-      "-c",
-      `import zipfile,os,sys
+  if (buildMac) {
+    console.log("[build] macOS 已由 electron-builder 生成 dmg/zip，跳过 Windows 便携版压缩。");
+  } else {
+    const pkgVer = JSON.parse(readFileSync(join(appDir, "package.json"), "utf8")).version;
+    const zipName = `${cfg.appName}-便携版-${pkgVer}.zip`;
+    const zipPath = join(appDir, cfg.output, zipName);
+    rmSync(zipPath, { force: true });
+    execFileSync(
+      "python",
+      [
+        "-c",
+        `import zipfile,os,sys
 src,out=sys.argv[1],sys.argv[2]
 with zipfile.ZipFile(out,'w',zipfile.ZIP_DEFLATED,compresslevel=6) as z:
     for root,dirs,files in os.walk(src):
         for f in files:
             p=os.path.join(root,f)
             z.write(p,os.path.relpath(p,src))`,
-      join(appDir, cfg.output, "win-unpacked"),
-      zipPath,
-    ],
-    { stdio: "inherit" },
-  );
-  console.log(`[build] 便携版 zip: ${zipName}（解压即用，启动约 2 秒）`);
+        join(appDir, cfg.output, "win-unpacked"),
+        zipPath,
+      ],
+      { stdio: "inherit" },
+    );
+    console.log(`[build] 便携版 zip: ${zipName}（解压即用，启动约 2 秒）`);
+  }
 } catch (e) {
   console.error("[build] 生成便携版 zip 失败（不影响安装包）:", String(e && e.message));
 }

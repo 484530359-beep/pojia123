@@ -43,6 +43,10 @@ npx electron .         # 跑起来（默认加载 dist/）
 HS_DEV=1 npx electron .  # 连开发服务器
 ```
 
+macOS 下主进程使用原生 Node.js 文件安装器，不依赖 PowerShell。支持 Codex、
+Claude、Cursor、ZCode、DeepSeek Harness 和 WorkBuddy；豆包的 macOS 云端
+CDP 注入暂未接入。
+
 截图验收（开发用）：`HS_CAPTURE=<输出目录> npx electron .` 会逐页截图后自动退出。
 
 ## 打包
@@ -50,6 +54,14 @@ HS_DEV=1 npx electron .  # 连开发服务器
 ```bash
 npm run dist
 ```
+
+macOS 构建：
+
+```bash
+npm run dist:mac
+```
+
+该命令生成 macOS `dmg` 和 `zip`，目标架构为 Intel `x64` 与 Apple Silicon `arm64`。
 
 产物落在本文件夹的 `release/`：
 

@@ -291,9 +291,6 @@ export const TUTORIAL_TEXT = [
 export const QQ_LINK =
   "https://qun.qq.com/universal-share/share?ac=1&authKey=AmqBRfY3r1aoAQ9Z6fG4of58siZb3km62aQvbjLXwoUjt3428virhAVyuTMJ9b0w&busi_data=eyJncm91cENvZGUiOiI4MTk2Nzg3NjUiLCJ0b2tlbiI6Ijhhd0QrSFBmQzlOa013U3JaTW8zb1FqNWIvckZyNzBiaTh2NFhDTGNJd2pnWFF6Nng3WDF5MzNGNDVHdlJEMkwiLCJ1aW4iOiI5MTI2MjM1MTkifQ%3D%3D&data=8KZavIbYDW81Xal9lPzM3SielXJhsTUeukLp2rlNqnDuRY85txb1DjaK1TvtIqYUQzCC-sUzcaKpdY6fbir13w&svctype=4&tempid=h5_group_info";
 
-/** 满血中转站：导航栏点击后用系统浏览器打开注册页。 */
-export const RELAY_LINK = "https://api.zxcbug.com/register";
-
 /** 不会用点这里：导航栏点击后直接用系统浏览器打开 QQ 群。 */
 export const HELP_LINK = "https://qm.qq.com/q/4TA0NydIJ2";
 

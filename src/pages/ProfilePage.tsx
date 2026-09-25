@@ -79,7 +79,9 @@ export function ProfilePage({
             </span>
           </button>
         </div>
+      </div>
 
+      <div className="settings-card-block">
         <div className="app-inline-actions">
           <button type="button" className="btn btn-ghost" onClick={onQuit}>
             退出工具

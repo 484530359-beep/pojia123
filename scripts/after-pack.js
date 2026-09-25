@@ -37,6 +37,10 @@ function findRcedit() {
 }
 
 exports.default = async function afterPack(context) {
+  if (process.platform !== "win32" || context.electronPlatformName !== "win32") {
+    console.log("[after-pack] 非 Windows 目标，跳过 rcedit 与便携版卸载脚本。");
+    return;
+  }
   const appDir = context.appOutDir;
   const productName =
     (context.packager && context.packager.appInfo && context.packager.appInfo.productName) ||
