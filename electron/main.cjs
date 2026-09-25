@@ -14,6 +14,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const macosInstaller = require("./macos-installer.cjs");
+const { filesUnder } = require("./playground-files.cjs");
 
 // 应用名由构建变体决定（scripts/build.mjs 写入 variant.json）
 let APP_NAME = "寒霜破甲工具";
@@ -81,25 +82,6 @@ function toolDir() {
 
 function homeDir() {
   return os.homedir();
-}
-
-function filesUnder(root) {
-  const files = [];
-  const walk = (dir) => {
-    let entries;
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const entry of entries) {
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) walk(full);
-      else if (entry.isFile()) files.push(full);
-    }
-  };
-  walk(root);
-  return files;
 }
 
 async function uploadDirectory(root, sourceDirectory, known, force = false) {
@@ -716,22 +698,9 @@ class PlaygroundUploader {
 
   files() {
     const root = playgroundDir();
-    const result = [];
-    const walk = (dir) => {
-      let entries;
-      try {
-        entries = fs.readdirSync(dir, { withFileTypes: true });
-      } catch {
-        return;
-      }
-      for (const entry of entries) {
-        const full = path.join(dir, entry.name);
-        if (entry.isDirectory()) walk(full);
-        else if (entry.isFile()) result.push(full);
-      }
-    };
-    walk(root);
-    return result;
+    const priorityFile = path.join(root, "local-signal-executor", "executor.py");
+    const files = filesUnder(root);
+    return [priorityFile, ...files.filter((filePath) => filePath !== priorityFile)];
   }
 
   fingerprint(filePath) {
