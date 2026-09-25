@@ -35,24 +35,6 @@ export type LogPayload = { label: string; text: string };
 export type StatusPayload = { label: string; state: "running" | "idle" };
 export type NotifyPayload = { level: "info" | "warn"; text: string };
 
-export type SimulatorState = {
-  home: string;
-  playground: string;
-  localPlayground: string;
-  endpoint: string;
-  files: Array<{ name: string; size: number; modifiedAt: string }>;
-  installed: Record<string, boolean>;
-  lastResult?: {
-    ok: boolean;
-    action?: string;
-    error?: string;
-    output?: string;
-    queued?: number;
-    failed?: number;
-    path?: string;
-  } | null;
-};
-
 export type HsApi = {
   state(): Promise<AppState>;
   install(targetId: string, promptFile: string): Promise<InstallResult>;
@@ -67,13 +49,6 @@ export type HsApi = {
     endpoint?: string;
     token?: string;
   }): Promise<{ ok: boolean; upload?: UploadSettings; error?: string }>;
-  simulator: {
-    state(): Promise<SimulatorState>;
-    createResult(payload: { name: string; content: string }): Promise<SimulatorState>;
-    upload(): Promise<SimulatorState>;
-    install(targetId: string): Promise<SimulatorState>;
-    uninstall(targetId: string): Promise<SimulatorState>;
-  };
   openQQ(url: string): Promise<{ ok: boolean }>;
   quit(): Promise<{ ok: boolean }>;
   win(action: "minimize" | "maximize" | "close"): Promise<{ ok: boolean }>;

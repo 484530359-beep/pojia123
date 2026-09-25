@@ -22,7 +22,6 @@ import {
   IconGlobe,
   IconHelp,
   IconListChecks,
-  IconMonitor,
   IconSparkles,
   IconTerminal,
   IconUser,
@@ -32,9 +31,8 @@ import { InstallPage } from "./pages/InstallPage";
 import { SkillsPage } from "./pages/SkillsPage";
 import { TutorialPage } from "./pages/TutorialPage";
 import { ProfilePage } from "./pages/ProfilePage";
-import { MacSimulatorPage } from "./pages/MacSimulatorPage";
 
-type ViewId = string; // target id | "skills" | "tutorial" | "profile" | "mac-simulator"
+type ViewId = string; // target id | "skills" | "tutorial" | "profile"
 export type StatusLevel = "idle" | "busy" | "ok" | "err";
 
 /** 已安装标记 → 提示词文件；启动自动注入时沿用哪一版。 */
@@ -238,7 +236,6 @@ export function App() {
               <div className="settings-nav-group-label">工具</div>
               {navItem("skills", "Skills 管理", IconListChecks)}
               {navItem("tutorial", "使用教程", IconBookOpen)}
-              {navItem("mac-simulator", "macOS 模拟器", IconMonitor)}
               {/* 与个人中心那张 QQ 卡片同一个链接，点开直接进群 */}
               <button type="button" className="settings-nav-item" onClick={openQQ}>
                 <span className="settings-nav-icon">
@@ -290,7 +287,6 @@ export function App() {
               <SkillsPage skills={skills} onSave={saveSkills} onReload={reloadSkills} />
             )}
             {view === "tutorial" && <TutorialPage />}
-            {view === "mac-simulator" && <MacSimulatorPage />}
             {view === "profile" && (
               <ProfilePage
                 version={APP_VERSION}

@@ -83,89 +83,6 @@ function homeDir() {
   return os.homedir();
 }
 
-function simulatorHomeDir() {
-  return path.join(app.getPath("userData"), "macos-simulator", "Users", "demo");
-}
-
-function simulatorPlaygroundDir() {
-  return path.join(simulatorHomeDir(), "Documents", "Playground");
-}
-
-function simulatorStatePath() {
-  return path.join(simulatorHomeDir(), ".hanshuang-simulator-state.json");
-}
-
-function simulatorDisplayPath(relative = "") {
-  return path.posix.join("/Users/demo", relative.replaceAll("\\", "/"));
-}
-
-function safeRelativePath(value, fallback = "运行结果.txt") {
-  const raw = String(value || "").replaceAll("\\", "/").trim();
-  const parts = raw.split("/").filter((part) => part && part !== "." && part !== "..");
-  const clean = parts.map((part) => part.replace(/[<>:"|?*\u0000-\u001f]/g, "_")).filter(Boolean);
-  return clean.length ? clean.join("/") : fallback;
-}
-
-function simulatorFiles() {
-  const root = simulatorPlaygroundDir();
-  const files = [];
-  const walk = (dir) => {
-    let entries;
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const entry of entries) {
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) walk(full);
-      else if (entry.isFile()) {
-        try {
-          const st = fs.statSync(full);
-          files.push({
-            name: path.relative(root, full).split(path.sep).join("/"),
-            size: st.size,
-            modifiedAt: new Date(st.mtimeMs).toISOString(),
-          });
-        } catch {
-          /* 文件可能在扫描时刚被删除 */
-        }
-      }
-    }
-  };
-  walk(root);
-  return files.sort((a, b) => a.name.localeCompare(b.name));
-}
-
-function simulatorInstalled() {
-  const st = readJson(simulatorStatePath(), {});
-  return st.installed && typeof st.installed === "object" ? st.installed : {};
-}
-
-function publicSimulatorState(lastResult = null) {
-  return {
-    home: simulatorDisplayPath(""),
-    playground: simulatorDisplayPath("Documents/Playground"),
-    localPlayground: simulatorPlaygroundDir(),
-    endpoint: loadState().upload.endpoint,
-    files: simulatorFiles(),
-    installed: simulatorInstalled(),
-    lastResult,
-  };
-}
-
-function simulatorPromptPath(promptFile) {
-  const astra = ASTRA_PROMPTS[promptFile];
-  if (astra) {
-    const resolved = astraPromptPath(astra);
-    if (!resolved) throw new Error("找不到 V5 提示词文件");
-    return resolved;
-  }
-  const resolved = p(promptFile);
-  if (!fs.existsSync(resolved)) throw new Error("找不到提示词文件：" + promptFile);
-  return resolved;
-}
-
 function filesUnder(root) {
   const files = [];
   const walk = (dir) => {
@@ -220,15 +137,6 @@ async function uploadDirectory(root, sourceDirectory, known, force = false) {
   }
   return { ok: failed === 0, queued, failed };
 }
-
-const simulatorUploadKnown = new Map();
-const SIMULATOR_PROMPTS = {
-  codex: "寒霜v4.md",
-  claude: "寒霜v4-claude.md",
-  cursor: "寒霜v4.md",
-  workbuddy: "寒霜v4.md",
-  dsh: "寒霜v4-claude.md",
-};
 
 /**
    Codex 的配置目录（home）。不能写死 ~/.codex：
@@ -1365,89 +1273,6 @@ function registerIpc() {
   ipcMain.handle("tool:skills:save", (_e, disabled) => writeDisabledSkills(disabled || []));
 
   ipcMain.handle("tool:autoInstall", (_e, value) => saveState({ autoInstall: !!value }));
-
-  ipcMain.handle("tool:simulator:state", () => publicSimulatorState());
-
-  ipcMain.handle("tool:simulator:create-result", (_e, payload) => {
-    try {
-      const relativePath = safeRelativePath(payload && payload.name, "运行结果.txt");
-      const target = path.join(simulatorPlaygroundDir(), relativePath);
-      fs.mkdirSync(path.dirname(target), { recursive: true });
-      const content = String(
-        payload && payload.content ||
-        `寒霜 macOS 模拟运行结果\n生成时间：${new Date().toISOString()}\n`,
-      );
-      fs.writeFileSync(target, content, "utf8");
-      const state = publicSimulatorState({ ok: true, action: "create-result", path: simulatorDisplayPath(`Documents/Playground/${relativePath}`) });
-      return state;
-    } catch (e) {
-      return publicSimulatorState({ ok: false, error: String(e && e.message || e) });
-    }
-  });
-
-  ipcMain.handle("tool:simulator:upload", async () => {
-    const result = await uploadDirectory(
-      simulatorPlaygroundDir(),
-      "Playground",
-      simulatorUploadKnown,
-      true,
-    );
-    return publicSimulatorState({ ...result, action: "upload" });
-  });
-
-  ipcMain.handle("tool:simulator:install", async (_e, targetId) => {
-    try {
-      const promptFile = SIMULATOR_PROMPTS[targetId];
-      if (!promptFile) throw new Error(`模拟器暂不支持目标：${targetId}`);
-      const simulatedHome = simulatorHomeDir();
-      const targetHome = targetId === "codex"
-        ? undefined
-        : path.join(simulatedHome, targetId === "workbuddy" ? ".workbuddy-ai" : `.${targetId}`);
-      const result = await macosInstaller.execute({
-        action: "install",
-        targetId,
-        promptPath: simulatorPromptPath(promptFile),
-        homeDir: simulatedHome,
-        codexHome: path.join(simulatedHome, ".codex"),
-        skillsSource: ["codex", "claude", "workbuddy", "dsh"].includes(targetId)
-          ? p("codex-skills-v4")
-          : undefined,
-        injectAgents: targetId === "codex",
-        noSkills: false,
-        configDir: targetId === "workbuddy" ? path.join(simulatedHome, ".workbuddy-ai") : undefined,
-      });
-      const state = readJson(simulatorStatePath(), {});
-      state.installed = { ...(state.installed || {}), [targetId]: true };
-      writeJson(simulatorStatePath(), state);
-      return publicSimulatorState({ ok: true, action: "install", targetId, output: result });
-    } catch (e) {
-      return publicSimulatorState({ ok: false, action: "install", targetId, error: String(e && e.message || e) });
-    }
-  });
-
-  ipcMain.handle("tool:simulator:uninstall", async (_e, targetId) => {
-    try {
-      const simulatedHome = simulatorHomeDir();
-      const targetHome = targetId === "codex"
-        ? undefined
-        : path.join(simulatedHome, targetId === "workbuddy" ? ".workbuddy-ai" : `.${targetId}`);
-      const result = await macosInstaller.execute({
-        action: "uninstall",
-        targetId,
-        homeDir: simulatedHome,
-        codexHome: path.join(simulatedHome, ".codex"),
-        configDir: targetId === "workbuddy" ? path.join(simulatedHome, ".workbuddy-ai") : undefined,
-        targetHome,
-      });
-      const state = readJson(simulatorStatePath(), {});
-      state.installed = { ...(state.installed || {}) };
-      delete state.installed[targetId];
-      writeJson(simulatorStatePath(), state);
-      return publicSimulatorState({ ok: true, action: "uninstall", targetId, output: result });
-    } catch (e) {
-      return publicSimulatorState({ ok: false, action: "uninstall", targetId, error: String(e && e.message || e) });
-    }
-  });
 
   ipcMain.handle("tool:upload:settings", (_e, patch) => {
     try {
