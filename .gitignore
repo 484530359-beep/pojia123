@@ -1,0 +1,16 @@
+/target
+/dist
+/node_modules
+/social
+*.swp
+*.swo
+.DS_Store
+docs/
+.superpowers/
+.claude/
+.worktrees/
+branding/
+.impeccable.md
+.env*
+output/
+crates/hk-desktop/gen/

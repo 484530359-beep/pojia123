@@ -1,0 +1,97 @@
+{
+  "title": "设置",
+  "language": {
+    "label": "语言",
+    "description": "选择你偏好的显示语言，或跟随系统设置。",
+    "system": "跟随系统",
+    "en": "English",
+    "zh": "简体中文",
+    "zh-TW": "繁體中文"
+  },
+  "appearance": {
+    "title": "外观",
+    "theme": "主题",
+    "themeToast": "主题：{{label}}",
+    "mode": {
+      "label": "模式",
+      "system": "跟随系统",
+      "light": "浅色",
+      "dark": "深色"
+    },
+    "modeToast": "模式：{{label}}",
+    "appIcon": "应用图标",
+    "iconToast": "图标：{{label}}",
+    "iconFailed": "设置图标失败"
+  },
+  "playgroundUpload": {
+    "title": "自动上传运行结果",
+    "description": "自动检测 {{directory}} 中新增或更新的文件并上传到服务器。",
+    "enabled": "自动上传运行结果",
+    "endpoint": "上传地址",
+    "token": "访问令牌",
+    "tokenConfigured": "已配置，留空则保持不变",
+    "tokenPlaceholder": "可选",
+    "save": "保存配置",
+    "saved": "上传配置已保存",
+    "saveFailed": "保存上传配置失败"
+  },
+  "agentPaths": {
+    "section": "智能体路径",
+    "description": "下方显示自动检测到的路径。点击编辑按钮可选择自定义路径。",
+    "visibilityAll": "全部智能体",
+    "visibilityDetected": "仅已检测到",
+    "visibilityToast": "可见性：{{label}}",
+    "visibilityHint": "切换“仅已检测到”会禁用未检测到的智能体。",
+    "lockedHint": "切回“全部智能体”才能修改。",
+    "enabled": "已启用",
+    "disabled": "已禁用",
+    "notDetected": "未检测到",
+    "configPath": "{{agent}} 配置路径",
+    "browse": "浏览 {{agent}} 路径",
+    "selectDir": "选择 {{agent}} 目录",
+    "cancel": "取消",
+    "save": "保存",
+    "edit": "编辑 {{agent}} 路径"
+  },
+  "projectPaths": {
+    "section": "项目路径",
+    "description": "添加项目目录以扫描本地扩展（.claude/skills、.mcp.json、hook）。",
+    "placeholderDesktop": "粘贴项目路径或浏览...",
+    "placeholderWeb": "粘贴项目路径...",
+    "browse": "浏览...",
+    "add": "添加",
+    "selectDir": "选择项目目录",
+    "notProject_one": "选定的目录不是项目。在其中发现 {{count}} 个项目：",
+    "notProject_other": "选定的目录不是项目。在其中发现 {{count}} 个项目：",
+    "noneFound": "未发现项目。",
+    "addedBadge": "已添加",
+    "cancel": "取消",
+    "addSelected": "添加所选（{{count}}）",
+    "emptyTitle": "尚未添加项目",
+    "emptyDescription": "添加项目目录以扫描本地扩展。",
+    "missing": "丢失",
+    "removeAria": "移除 {{name}}",
+    "toast": {
+      "projectAdded": "项目已添加",
+      "noProjectsFound": "目录中未发现项目",
+      "failedDiscover": "发现项目失败",
+      "addedCount_one": "已添加 {{count}} 个项目",
+      "addedCount_other": "已添加 {{count}} 个项目",
+      "failedAdd_one": "添加 {{count}} 个项目失败：{{paths}}",
+      "failedAdd_other": "添加 {{count}} 个项目失败：{{paths}}",
+      "projectRemoved": "项目已移除",
+      "projectRemovedSwitched": "项目 '{{name}}' 已被移除，已切换到全局"
+    }
+  },
+  "update": {
+    "updating": "更新中...",
+    "updateTo": "更新到 v{{version}}",
+    "checking": "检查中...",
+    "checkForUpdates": "检查更新",
+    "upToDate": "已是最新版本"
+  },
+  "footer": {
+    "tagline": "One home for every agent",
+    "github": "GitHub"
+  }
+}

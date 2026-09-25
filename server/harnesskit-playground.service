@@ -1,0 +1,24 @@
+[Unit]
+Description=HarnessKit Playground run-result receiver
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=harnesskit-upload
+Group=harnesskit-upload
+WorkingDirectory=/opt/harnesskit-playground
+ExecStart=/usr/bin/python3 /opt/harnesskit-playground/playground_receiver.py
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/harnesskit-playground
+Environment=HK_UPLOAD_HOST=0.0.0.0
+Environment=HK_UPLOAD_PORT=18400
+Environment=HK_UPLOAD_ROOT=/var/lib/harnesskit-playground
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,331 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  MACOSX_DEPLOYMENT_TARGET: "12.0"
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      release_id: ${{ steps.create.outputs.release_id }}
+      changelog: ${{ steps.changelog.outputs.body }}
+      # Desktop (latest.json) variant: translation comment blocks converted to
+      # legacy language fences so clients ≤1.7.0 still localize the updater
+      # dialog. Identical to `changelog` when the notes have no comment block.
+      changelog_desktop: ${{ steps.changelog.outputs.body_desktop }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate changelog
+        id: changelog
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -n "$PREV_TAG" ]; then
+            BODY=$(gh api repos/${{ github.repository }}/releases/generate-notes \
+              -f tag_name="${{ github.ref_name }}" \
+              -f previous_tag_name="$PREV_TAG" \
+              --jq '.body')
+          else
+            BODY=$(gh api repos/${{ github.repository }}/releases/generate-notes \
+              -f tag_name="${{ github.ref_name }}" \
+              --jq '.body')
+          fi
+          if [ -z "$BODY" ]; then
+            BODY="Bug fixes and improvements."
+          fi
+          # Prepend hand-written highlights from .github/release-notes/<tag>.md
+          # so they appear both on the GitHub release page and in latest.json
+          # (which feeds the in-app updater dialog).
+          HIGHLIGHTS_FILE=".github/release-notes/${{ github.ref_name }}.md"
+          if [ -s "$HIGHLIGHTS_FILE" ]; then
+            HIGHLIGHTS=$(cat "$HIGHLIGHTS_FILE")
+            BODY="$(printf '%s\n\n%s' "$HIGHLIGHTS" "$BODY")"
+          fi
+          {
+            echo "body<<CHANGELOG_EOF"
+            echo "$BODY"
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+          # Desktop variant for latest.json: convert translation comment
+          # blocks into legacy fences (see scripts/notes-desktop-variant.mjs).
+          echo "$BODY" > /tmp/release-body.md
+          BODY_DESKTOP=$(node scripts/notes-desktop-variant.mjs /tmp/release-body.md)
+          {
+            echo "body_desktop<<CHANGELOG_EOF"
+            echo "$BODY_DESKTOP"
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create draft release
+        id: create
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Pass body through an env var so any quotes / backticks / $
+          # characters from auto-generated PR titles or hand-written
+          # release-notes don't break shell parsing of the `-f body=`
+          # argument below.
+          BODY: ${{ steps.changelog.outputs.body }}
+        run: |
+          RELEASE_ID=$(gh api repos/${{ github.repository }}/releases \
+            -f tag_name="${{ github.ref_name }}" \
+            -f name="HarnessKit ${{ github.ref_name }}" \
+            -f body="$BODY" \
+            -F draft=true \
+            --jq '.id')
+          echo "release_id=$RELEASE_ID" >> "$GITHUB_OUTPUT"
+
+  release-desktop:
+    needs: create-release
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            arch: arm64
+          - target: x86_64-apple-darwin
+            arch: x64
+    # Pinned to macos-26 (adopted 2026-09): builds pick up the SDK 26+ window
+    # chrome, verified on macOS 27 — traffic lights render correctly at the
+    # current trafficLightPosition, no white frame. Keep an explicit pin (never
+    # macos-latest) so runner image migrations can't silently change the SDK.
+    runs-on: macos-26
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --locked
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Import Apple certificate
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE" ]; then
+            echo "No certificate provided, skipping"
+            exit 0
+          fi
+          echo "$APPLE_CERTIFICATE" | base64 --decode > certificate.p12
+          security create-keychain -p actions build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p actions build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions build.keychain
+          rm certificate.p12
+
+      - name: Build desktop app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          # Required so tauri-action populates `latest.json`'s `notes` field;
+          # without it the in-app updater shows an empty changelog. Uses the
+          # fence-format desktop variant so ≤1.7.0 clients localize it too —
+          # the GitHub release body keeps the comment-block format instead.
+          releaseBody: ${{ needs.create-release.outputs.changelog_desktop }}
+          tauriScript: cargo tauri
+          args: --target ${{ matrix.target }}
+
+      - name: Build CLI (with embedded web frontend)
+        run: |
+          npm run build
+          cargo build --release --target ${{ matrix.target }} -p hk-cli
+
+      # The desktop .app above is signed and notarized by tauri-action, but the
+      # CLI binary would otherwise ship ad-hoc signed — Gatekeeper rejects it
+      # when downloaded via a browser (quarantine flag). The certificate is
+      # already in the keychain and the notary credentials in secrets, so sign
+      # and notarize the CLI here too. A bare Mach-O cannot be stapled (only
+      # .app/.dmg/.pkg can), so Gatekeeper validates the first run online —
+      # the standard approach for CLI tools.
+      - name: Sign and notarize CLI
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -z "$APPLE_SIGNING_IDENTITY" ]; then
+            echo "No signing identity provided, skipping (CLI stays ad-hoc signed)"
+            exit 0
+          fi
+          # The keychain auto-locks after 3600s (see Import Apple certificate);
+          # the desktop build + notarization above can outlast that, so unlock
+          # again before signing.
+          security unlock-keychain -p actions build.keychain
+          BIN="target/${{ matrix.target }}/release/hk"
+          codesign --force --options runtime --timestamp \
+            --sign "$APPLE_SIGNING_IDENTITY" "$BIN"
+          ditto -c -k "$BIN" hk-notarize.zip
+          xcrun notarytool submit hk-notarize.zip \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+          rm hk-notarize.zip
+          codesign --verify --verbose=2 "$BIN"
+
+      - name: Upload CLI to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cp "target/${{ matrix.target }}/release/hk" "hk-macos-${{ matrix.arch }}"
+          gh release upload "${{ github.ref_name }}" "hk-macos-${{ matrix.arch }}" --clobber
+
+  release-cli-linux:
+    needs: create-release
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          key: x86_64-unknown-linux-musl
+
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools perl make
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build CLI (with embedded web frontend)
+        run: |
+          npm run build
+          cargo build --release -p hk-cli --target x86_64-unknown-linux-musl
+
+      - name: Upload CLI to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cp target/x86_64-unknown-linux-musl/release/hk hk-linux-x64
+          gh release upload "${{ github.ref_name }}" hk-linux-x64 --clobber
+
+  release-cli-linux-arm64:
+    needs: create-release
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          key: aarch64-unknown-linux-musl
+
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools perl make
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build CLI (with embedded web frontend)
+        run: |
+          npm run build
+          cargo build --release -p hk-cli --target aarch64-unknown-linux-musl
+
+      - name: Upload CLI to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cp target/aarch64-unknown-linux-musl/release/hk hk-linux-arm64
+          gh release upload "${{ github.ref_name }}" hk-linux-arm64 --clobber
+
+  release-cli-windows:
+    needs: create-release
+    # Pinned to windows-2025 so a future windows-latest OS-major migration can't
+    # silently change the build env (same control-your-upgrade-timing rationale
+    # as the macos-15 pin). Keeps the current, working Server 2025 + VS2026 image.
+    runs-on: windows-2025
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build CLI (with embedded web frontend)
+        run: |
+          npm run build
+          cargo build --release -p hk-cli
+
+      - name: Upload CLI to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          cp target/release/hk.exe hk-windows-x64.exe
+          gh release upload "${{ github.ref_name }}" hk-windows-x64.exe --clobber

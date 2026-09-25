@@ -1,0 +1,376 @@
+// MCP config reference: https://cursor.com/docs/mcp
+// Config file: ~/.cursor/mcp.json (global), .cursor/mcp.json (project)
+// Format: JSON, top-level key "mcpServers", sub-keys: command, args, env, url, headers
+//
+// Plugin reference: https://cursor.com/docs/plugins
+// Plugins: ~/.cursor/plugins/, manifest at .cursor-plugin/plugin.json
+
+use super::{
+    AgentAdapter, HookEntry, HookFormat, McpServerEntry, PluginEntry, ProjectMarker,
+    RemoteMcpSchema,
+};
+use std::path::{Path, PathBuf};
+
+pub struct CursorAdapter {
+    home: PathBuf,
+}
+
+impl Default for CursorAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CursorAdapter {
+    pub fn new() -> Self {
+        Self {
+            home: dirs::home_dir().unwrap_or_default(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_home(home: PathBuf) -> Self {
+        Self { home }
+    }
+
+    fn parse_json(path: &Path) -> Option<serde_json::Value> {
+        let content = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str(&content).ok()
+    }
+}
+
+impl AgentAdapter for CursorAdapter {
+    fn hook_format(&self) -> HookFormat {
+        HookFormat::Cursor
+    }
+    fn name(&self) -> &str {
+        "cursor"
+    }
+
+    fn base_dir(&self) -> PathBuf {
+        self.home.join(".cursor")
+    }
+
+    fn detect(&self) -> bool {
+        self.base_dir().exists()
+    }
+
+    fn skill_dirs(&self) -> Vec<PathBuf> {
+        vec![
+            self.base_dir().join("skills"),
+            self.home.join(".agents").join("skills"),
+        ]
+    }
+
+    fn project_skill_dirs(&self) -> Vec<String> {
+        // Cursor project skills (no documented minimum version).
+        // Source: https://cursor.com/docs/skills
+        vec![".cursor/skills".into()]
+    }
+
+    fn mcp_config_path(&self) -> PathBuf {
+        self.base_dir().join("mcp.json")
+    }
+
+    fn hook_config_path(&self) -> PathBuf {
+        self.base_dir().join("hooks.json")
+    }
+
+    fn plugin_dirs(&self) -> Vec<PathBuf> {
+        vec![self.base_dir().join("plugins")]
+    }
+
+    fn read_mcp_servers(&self) -> Vec<McpServerEntry> {
+        self.read_mcp_servers_from(&self.mcp_config_path())
+    }
+
+    fn read_mcp_servers_from(&self, path: &Path) -> Vec<McpServerEntry> {
+        let Some(config) = Self::parse_json(path) else {
+            return vec![];
+        };
+        let Some(servers) = config.get("mcpServers").and_then(|v| v.as_object()) else {
+            return vec![];
+        };
+        servers
+            .iter()
+            .map(|(name, val)| {
+                // Remote entries: {url, headers} — protocol auto-detected by Cursor.
+                let (transport, url) = super::parse_plain_url(val, "url");
+                McpServerEntry {
+                    name: name.clone(),
+                    command: val
+                        .get("command")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .into(),
+                    args: super::json_string_vec(val, "args"),
+                    env: super::json_string_map(val, "env"),
+                    transport,
+                    url,
+                    headers: super::json_string_map(val, "headers"),
+                    // Cursor's MCP schema has no agent-native disable concept.
+                    enabled: true,
+                }
+            })
+            .collect()
+    }
+
+    fn remote_mcp_schema(&self) -> RemoteMcpSchema {
+        RemoteMcpSchema::PlainUrl
+    }
+
+    fn translate_hook_event(&self, event: &str) -> Option<String> {
+        super::hook_events::to_cursor(event)
+    }
+
+    fn read_hooks(&self) -> Vec<HookEntry> {
+        self.read_hooks_from(&self.hook_config_path())
+    }
+
+    fn read_hooks_from(&self, path: &Path) -> Vec<HookEntry> {
+        let Some(config) = Self::parse_json(path) else {
+            return vec![];
+        };
+        let Some(hooks) = config.get("hooks").and_then(|v| v.as_object()) else {
+            return vec![];
+        };
+        let mut entries = Vec::new();
+        for (event, hook_list) in hooks {
+            let Some(arr) = hook_list.as_array() else {
+                continue;
+            };
+            for hook in arr {
+                // Cursor format: {"command": "..."} — no matcher, no nested hooks array
+                if let Some(cmd) = hook.get("command").and_then(|v| v.as_str()) {
+                    entries.push(HookEntry {
+                        event: event.clone(),
+                        matcher: None,
+                        command: cmd.to_string(),
+                        enabled: true,
+                    });
+                }
+            }
+        }
+        entries
+    }
+
+    fn global_settings_files(&self) -> Vec<PathBuf> {
+        vec![
+            self.base_dir().join("mcp.json"),
+            self.base_dir().join("permissions.json"),
+            self.base_dir().join("hooks.json"),
+        ]
+    }
+
+    fn global_subagent_files(&self) -> Vec<PathBuf> {
+        // ~/.cursor/agents/*.md
+        super::files_with_ext(&self.base_dir().join("agents"), "md").collect()
+    }
+
+    fn project_markers(&self) -> Vec<ProjectMarker> {
+        vec![
+            ProjectMarker::Dir(".cursor/rules"),
+            ProjectMarker::File(".cursorrules"),
+        ]
+    }
+
+    fn project_rules_patterns(&self) -> Vec<String> {
+        vec![
+            ".cursorrules".into(),
+            // Cursor loads .mdc rules from nested subfolders of .cursor/rules;
+            // plain .md files there are ignored by Cursor entirely, so they
+            // are deliberately not scanned.
+            ".cursor/rules/**/*.mdc".into(),
+            "AGENTS.md".into(),
+        ]
+    }
+
+    fn project_memory_patterns(&self) -> Vec<String> {
+        vec![".cursor/notepads/*.md".into()]
+    }
+
+    fn project_settings_patterns(&self) -> Vec<String> {
+        vec![".cursor/mcp.json".into()]
+    }
+
+    fn project_subagent_patterns(&self) -> Vec<String> {
+        vec![".cursor/agents/*.md".into()]
+    }
+
+    fn project_ignore_patterns(&self) -> Vec<String> {
+        vec![".cursorignore".into(), ".cursorindexingignore".into()]
+    }
+
+    fn project_mcp_config_relpath(&self) -> Option<String> {
+        Some(".cursor/mcp.json".into())
+    }
+
+    fn project_hook_config_relpath(&self) -> Option<String> {
+        // Cursor hooks live in `.cursor/hooks.json` at the project root.
+        // Source: https://cursor.com/docs/hooks
+        Some(".cursor/hooks.json".into())
+    }
+
+    fn read_plugins(&self) -> Vec<PluginEntry> {
+        // Cursor plugins: ~/.cursor/plugins/local/{plugin}/.cursor-plugin/plugin.json
+        let local_dir = self.base_dir().join("plugins").join("local");
+        let mut entries = Vec::new();
+        if let Ok(dirs) = std::fs::read_dir(&local_dir) {
+            for dir in dirs.flatten() {
+                if !dir.path().is_dir() {
+                    continue;
+                }
+                let manifest = dir.path().join(".cursor-plugin").join("plugin.json");
+                if !manifest.exists() {
+                    continue;
+                }
+                let name = if let Ok(content) = std::fs::read_to_string(&manifest) {
+                    serde_json::from_str::<serde_json::Value>(&content)
+                        .ok()
+                        .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(String::from))
+                        .unwrap_or_else(|| dir.file_name().to_string_lossy().to_string())
+                } else {
+                    dir.file_name().to_string_lossy().to_string()
+                };
+                entries.push(PluginEntry {
+                    name,
+                    source: "local".into(),
+                    enabled: true,
+                    path: Some(dir.path()),
+                    source_url: None,
+                    uri: None,
+                    installed_at: None,
+                    updated_at: None,
+                    base_layers: vec![],
+                    pack: None,
+                });
+            }
+        }
+        // Also scan marketplace-installed plugins if they exist
+        // Cursor may cache installed plugins similarly to Codex
+        let cache_dir = self.base_dir().join("plugins").join("cache");
+        if let Ok(marketplaces) = std::fs::read_dir(&cache_dir) {
+            for marketplace in marketplaces.flatten() {
+                if !marketplace.path().is_dir() {
+                    continue;
+                }
+                let mp_name = marketplace.file_name().to_string_lossy().to_string();
+                if let Ok(plugins) = std::fs::read_dir(marketplace.path()) {
+                    for plugin in plugins.flatten() {
+                        if !plugin.path().is_dir() {
+                            continue;
+                        }
+                        let manifest = plugin.path().join(".cursor-plugin").join("plugin.json");
+                        let name = if manifest.exists() {
+                            std::fs::read_to_string(&manifest)
+                                .ok()
+                                .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+                                .and_then(|v| {
+                                    v.get("name").and_then(|n| n.as_str()).map(String::from)
+                                })
+                                .unwrap_or_else(|| plugin.file_name().to_string_lossy().to_string())
+                        } else {
+                            plugin.file_name().to_string_lossy().to_string()
+                        };
+                        entries.push(PluginEntry {
+                            name,
+                            source: mp_name.clone(),
+                            enabled: true,
+                            path: Some(plugin.path()),
+                            source_url: None,
+                            uri: None,
+                            installed_at: None,
+                            updated_at: None,
+                            base_layers: vec![],
+                            pack: None,
+                        });
+                    }
+                }
+            }
+        }
+        entries
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{AgentAdapter, McpTransport};
+    use super::*;
+
+    #[test]
+    fn read_mcp_servers_parses_url_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("mcp.json");
+        std::fs::write(
+            &config,
+            r#"{"mcpServers":{
+                "linear":{"url":"https://mcp.linear.app/mcp","headers":{"X-K":"v"}},
+                "fs":{"command":"npx","args":["-y","server-fs"]}
+            }}"#,
+        )
+        .unwrap();
+        let adapter = CursorAdapter::with_home(tmp.path().to_path_buf());
+        let servers = adapter.read_mcp_servers_from(&config);
+        let linear = servers.iter().find(|s| s.name == "linear").unwrap();
+        assert_eq!(linear.transport, McpTransport::Http);
+        assert_eq!(linear.url.as_deref(), Some("https://mcp.linear.app/mcp"));
+        assert_eq!(linear.command, "");
+        assert_eq!(linear.headers["X-K"], "v");
+        let fs = servers.iter().find(|s| s.name == "fs").unwrap();
+        assert_eq!(fs.transport, McpTransport::Stdio);
+    }
+
+    #[test]
+    fn test_cursor_subagent_methods() {
+        let tmp = tempfile::tempdir().unwrap();
+        let adapter = CursorAdapter::with_home(tmp.path().to_path_buf());
+
+        assert!(adapter.global_subagent_files().is_empty());
+
+        let agents_dir = adapter.base_dir().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(agents_dir.join("reviewer.md"), "# reviewer").unwrap();
+        std::fs::write(agents_dir.join("notes.txt"), "ignore me").unwrap();
+
+        let subagents = adapter.global_subagent_files();
+        assert!(subagents.iter().any(|p| p.ends_with("agents/reviewer.md")));
+        assert!(
+            !subagents.iter().any(|p| p.ends_with("notes.txt")),
+            "non-.md files in agents/ must be filtered"
+        );
+
+        let settings = adapter.global_settings_files();
+        assert!(
+            !settings.iter().any(|p| p.ends_with("agents/reviewer.md")),
+            "agents/ moved to global_subagent_files; must not appear in settings"
+        );
+
+        assert_eq!(
+            adapter.project_subagent_patterns(),
+            vec![".cursor/agents/*.md".to_string()]
+        );
+    }
+
+    #[test]
+    fn read_hooks_cursor_format() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cursor_dir = tmp.path().join(".cursor");
+        std::fs::create_dir_all(&cursor_dir).unwrap();
+        std::fs::write(cursor_dir.join("hooks.json"),
+            r#"{"version":1,"hooks":{"afterFileEdit":[{"command":"./audit.sh"}],"stop":[{"command":"echo done"}]}}"#
+        ).unwrap();
+        let adapter = CursorAdapter::with_home(tmp.path().to_path_buf());
+        let hooks = adapter.read_hooks();
+        assert_eq!(hooks.len(), 2);
+        assert!(
+            hooks
+                .iter()
+                .any(|h| h.event == "afterFileEdit" && h.command == "./audit.sh")
+        );
+        assert!(
+            hooks
+                .iter()
+                .any(|h| h.event == "stop" && h.command == "echo done")
+        );
+    }
+}

@@ -1,0 +1,60 @@
+{
+  "productName": "HarnessKit",
+  "version": "1.10.4",
+  "identifier": "com.harnesskit.app",
+  "build": {
+    "frontendDist": "../../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "title": "HarnessKit",
+        "hiddenTitle": true,
+        "titleBarStyle": "Overlay",
+        "trafficLightPosition": { "x": 16, "y": 18 },
+        "decorations": true,
+        "width": 1280,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 600,
+        "transparent": true,
+        "windowEffects": {
+          "effects": ["sidebar"],
+          "state": "followsWindowActiveState"
+        }
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self' ipc: asset: https://ipc.localhost; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' asset: https://ipc.localhost data: https://raw.githubusercontent.com https://api.smithery.ai; connect-src ipc: https://ipc.localhost https://skills.sh https://api.smithery.ai https://raw.githubusercontent.com https://api.github.com https://add-skill.vercel.sh; font-src 'self' https://fonts.gstatic.com data:"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/RealZST/HarnessKit/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDVFNzExMjg4RkQ0QTVDQzcKUldUSFhFcjlpQkp4WGpGbm5DcUpsSmcwSitmbTl5MVAzSkc5QkJuaEtYbGdyT1JlY05JS3lyY1MK"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "createUpdaterArtifacts": true,
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": [
+      "icons/app-icon-1.png",
+      "icons/app-icon-2.png",
+      "../../resources/hanshuang"
+    ]
+  }
+}

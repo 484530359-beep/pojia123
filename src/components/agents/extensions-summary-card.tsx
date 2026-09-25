@@ -1,0 +1,86 @@
+import { ArrowRight, Package } from "lucide-react";
+import { useTranslation } from "react-i18next";
+import { useNavigate } from "react-router-dom";
+import type { ExtensionCounts } from "@/lib/types";
+
+export function ExtensionsSummaryCard({
+  counts,
+  agentName,
+  activeScope,
+}: {
+  counts: ExtensionCounts;
+  agentName: string;
+  /** Forwarded so the link to /extensions can pre-apply the same scope filter. */
+  activeScope?: string | null;
+}) {
+  const { t } = useTranslation("agents");
+  const navigate = useNavigate();
+  const total =
+    counts.skill + counts.mcp + counts.plugin + counts.hook + counts.cli;
+  if (total === 0) return null;
+
+  const buildHref = () => {
+    const params = new URLSearchParams();
+    params.set("agent", agentName);
+    if (activeScope) params.set("scope", activeScope);
+    return `/extensions?${params.toString()}`;
+  };
+
+  return (
+    <div className="mb-5" id="section-extensions">
+      <div className="flex items-center gap-2 mb-2 px-1">
+        <Package size={14} className="text-muted-foreground" />
+        <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+          {t("summary.title")}
+        </span>
+        <span className="text-[10px] bg-muted px-1.5 py-0.5 rounded-full text-muted-foreground">
+          {total}
+        </span>
+      </div>
+      <button
+        onClick={() => navigate(buildHref())}
+        className="w-full rounded-lg border border-border p-3.5 flex items-center justify-between transition-colors hover:bg-accent/30"
+      >
+        <div className="flex gap-4 text-[13px]">
+          {counts.skill > 0 && (
+            <span>
+              <strong>{counts.skill}</strong>{" "}
+              <span className="text-muted-foreground">
+                {t("summary.skill")}
+              </span>
+            </span>
+          )}
+          {counts.mcp > 0 && (
+            <span>
+              <strong>{counts.mcp}</strong>{" "}
+              <span className="text-muted-foreground">{t("summary.mcp")}</span>
+            </span>
+          )}
+          {counts.plugin > 0 && (
+            <span>
+              <strong>{counts.plugin}</strong>{" "}
+              <span className="text-muted-foreground">
+                {t("summary.plugin")}
+              </span>
+            </span>
+          )}
+          {counts.hook > 0 && (
+            <span>
+              <strong>{counts.hook}</strong>{" "}
+              <span className="text-muted-foreground">{t("summary.hook")}</span>
+            </span>
+          )}
+          {counts.cli > 0 && (
+            <span>
+              <strong>{counts.cli}</strong>{" "}
+              <span className="text-muted-foreground">{t("summary.cli")}</span>
+            </span>
+          )}
+        </div>
+        <span className="flex items-center gap-1 text-[12px] font-medium text-primary">
+          {t("summary.viewInExtensions")} <ArrowRight size={14} />
+        </span>
+      </button>
+    </div>
+  );
+}

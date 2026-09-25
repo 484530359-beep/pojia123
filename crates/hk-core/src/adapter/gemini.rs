@@ -1,0 +1,497 @@
+// MCP config reference:
+//   https://github.com/google-gemini/gemini-cli/blob/main/docs/tools/mcp-server.md
+//   https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/tutorials/mcp-setup.md
+// Config file: ~/.gemini/settings.json
+// Format: JSON, top-level key "mcpServers", sub-keys: command, args, env, url, httpUrl, headers
+//
+// Extension (plugin) reference: https://geminicli.com/docs/extensions/
+// Extensions: ~/.gemini/extensions/{name}/, manifest at gemini-extension.json
+
+use super::{
+    AgentAdapter, HookEntry, McpServerEntry, McpTransport, PluginEntry, ProjectMarker,
+    RemoteMcpSchema,
+};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+
+/// Read extension-enablement.json and return the set of extension names disabled at user scope.
+/// Gemini stores overrides as path-based rules; a rule starting with `!` means disabled.
+/// We check for `!{homedir}/*` to determine user-level disabled state.
+fn read_disabled_extensions(ext_dir: &Path, home: &Path) -> HashSet<String> {
+    let mut disabled = HashSet::new();
+    let enablement_path = ext_dir.join("extension-enablement.json");
+    let Ok(content) = std::fs::read_to_string(&enablement_path) else {
+        return disabled;
+    };
+    let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return disabled;
+    };
+    let home_prefix = format!("!{}/*", home.to_string_lossy());
+    let Some(obj) = config.as_object() else {
+        return disabled;
+    };
+    for (name, val) in obj {
+        let Some(overrides) = val.get("overrides").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        // "Last matching rule wins" — check last rule that matches user scope
+        let is_disabled = overrides.iter().rev().find_map(|rule| {
+            let s = rule.as_str()?;
+            if s == home_prefix {
+                Some(true) // disabled at user scope
+            } else if s == &home_prefix[1..] {
+                Some(false) // enabled at user scope (without `!`)
+            } else {
+                None // not a user-scope rule, skip
+            }
+        });
+        if is_disabled == Some(true) {
+            disabled.insert(name.clone());
+        }
+    }
+    disabled
+}
+
+pub struct GeminiAdapter {
+    home: PathBuf,
+}
+
+impl Default for GeminiAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GeminiAdapter {
+    pub fn new() -> Self {
+        Self {
+            home: dirs::home_dir().unwrap_or_default(),
+        }
+    }
+    #[cfg(test)]
+    pub fn with_home(home: PathBuf) -> Self {
+        Self { home }
+    }
+    fn parse_json(path: &Path) -> Option<serde_json::Value> {
+        let content = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str(&content).ok()
+    }
+}
+
+impl AgentAdapter for GeminiAdapter {
+    fn name(&self) -> &str {
+        "gemini"
+    }
+    fn base_dir(&self) -> PathBuf {
+        self.home.join(".gemini")
+    }
+    fn detect(&self) -> bool {
+        self.base_dir().exists()
+    }
+    fn skill_dirs(&self) -> Vec<PathBuf> {
+        vec![
+            self.base_dir().join("skills"),
+            self.home.join(".agents").join("skills"),
+        ]
+    }
+    fn project_skill_dirs(&self) -> Vec<String> {
+        // Gemini CLI workspace skills (also accepts .agents/skills as an alias —
+        // declaring only the canonical path here; cross-agent shared skills via
+        // .agents/skills are picked up by the Codex adapter naturally).
+        // Source: https://geminicli.com/docs/cli/skills/
+        vec![".gemini/skills".into()]
+    }
+    fn project_skill_read_dirs(&self) -> Vec<String> {
+        // Gemini reads .agents/skills too — declared separately so Kit-remove
+        // warnings flag cross-agent fallout.
+        vec![".agents/skills".into()]
+    }
+    fn mcp_config_path(&self) -> PathBuf {
+        self.base_dir().join("settings.json")
+    }
+    fn hook_config_path(&self) -> PathBuf {
+        self.base_dir().join("settings.json")
+    }
+    fn plugin_dirs(&self) -> Vec<PathBuf> {
+        vec![self.base_dir().join("extensions")]
+    }
+
+    fn global_rules_files(&self) -> Vec<PathBuf> {
+        vec![self.base_dir().join("GEMINI.md")]
+    }
+
+    fn global_settings_files(&self) -> Vec<PathBuf> {
+        let mut files = vec![
+            self.base_dir().join("settings.json"),
+            self.base_dir().join(".env"),
+        ];
+        // ~/.gemini/commands/*.toml
+        files.extend(super::files_with_ext(&self.base_dir().join("commands"), "toml"));
+        // ~/.gemini/policies/*.toml
+        files.extend(super::files_with_ext(&self.base_dir().join("policies"), "toml"));
+        files
+    }
+
+    fn global_subagent_files(&self) -> Vec<PathBuf> {
+        // ~/.gemini/agents/*.md
+        super::files_with_ext(&self.base_dir().join("agents"), "md").collect()
+    }
+
+    fn project_markers(&self) -> Vec<ProjectMarker> {
+        vec![ProjectMarker::Dir(".gemini")]
+    }
+
+    fn project_rules_patterns(&self) -> Vec<String> {
+        // Gemini CLI loads subdirectory GEMINI.md at any depth (startup BFS
+        // before v0.54, JIT on tool access since), but a `**/GEMINI.md` glob
+        // would walk the entire project tree (node_modules included) on every
+        // scan and surface vendored files. Two levels is a deliberate cap:
+        // deeper files still work in Gemini, they just aren't listed here.
+        vec![
+            "GEMINI.md".into(),
+            "*/GEMINI.md".into(),
+            "*/*/GEMINI.md".into(),
+        ]
+    }
+
+    fn project_settings_patterns(&self) -> Vec<String> {
+        vec![".gemini/settings.json".into()]
+    }
+
+    fn project_mcp_config_relpath(&self) -> Option<String> {
+        // Project-level Gemini MCP servers live under the `mcpServers` key in
+        // the same project settings file, `<repo>/.gemini/settings.json`
+        // (JSON, same shape as the global file at `~/.gemini/settings.json`).
+        Some(".gemini/settings.json".into())
+    }
+
+    fn project_subagent_patterns(&self) -> Vec<String> {
+        vec![".gemini/agents/*.md".into()]
+    }
+
+    fn project_ignore_patterns(&self) -> Vec<String> {
+        vec![".geminiignore".into()]
+    }
+
+    fn read_mcp_servers(&self) -> Vec<McpServerEntry> {
+        self.read_mcp_servers_from(&self.mcp_config_path())
+    }
+
+    fn read_mcp_servers_from(&self, path: &Path) -> Vec<McpServerEntry> {
+        let Some(settings) = Self::parse_json(path) else {
+            return vec![];
+        };
+        let Some(servers) = settings.get("mcpServers").and_then(|v| v.as_object()) else {
+            return vec![];
+        };
+        servers
+            .iter()
+            .map(|(name, val)| {
+                // Remote entries: `httpUrl` = Streamable HTTP, `url` = SSE
+                // (per gemini-cli's mcp-server.md). `httpUrl` wins if both
+                // are present, matching gemini-cli's own precedence.
+                let (transport, url) = match (
+                    val.get("httpUrl").and_then(|v| v.as_str()),
+                    val.get("url").and_then(|v| v.as_str()),
+                ) {
+                    (Some(http), _) => (McpTransport::Http, Some(http.to_string())),
+                    (None, Some(sse)) => (McpTransport::Sse, Some(sse.to_string())),
+                    (None, None) => (McpTransport::Stdio, None),
+                };
+                McpServerEntry {
+                    name: name.clone(),
+                    command: val
+                        .get("command")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .into(),
+                    args: super::json_string_vec(val, "args"),
+                    env: super::json_string_map(val, "env"),
+                    transport,
+                    url,
+                    headers: super::json_string_map(val, "headers"),
+                    // Gemini's MCP schema has no agent-native disable concept.
+                    enabled: true,
+                }
+            })
+            .collect()
+    }
+
+    fn remote_mcp_schema(&self) -> RemoteMcpSchema {
+        RemoteMcpSchema::GeminiSplit
+    }
+
+    fn read_plugins(&self) -> Vec<PluginEntry> {
+        // Gemini extensions: ~/.gemini/extensions/{name}/gemini-extension.json
+        let ext_dir = self.base_dir().join("extensions");
+        let Ok(dirs) = std::fs::read_dir(&ext_dir) else {
+            return vec![];
+        };
+        let disabled_set = read_disabled_extensions(&ext_dir, &self.home);
+        let mut entries = Vec::new();
+        for dir in dirs.flatten() {
+            if !dir.path().is_dir() {
+                continue;
+            }
+            let manifest = dir.path().join("gemini-extension.json");
+            let name = if manifest.exists() {
+                std::fs::read_to_string(&manifest)
+                    .ok()
+                    .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+                    .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(String::from))
+                    .unwrap_or_else(|| dir.file_name().to_string_lossy().to_string())
+            } else {
+                continue; // not a valid extension
+            };
+            let enabled = !disabled_set.contains(&name);
+            entries.push(PluginEntry {
+                name,
+                source: "gemini".into(),
+                enabled,
+                path: Some(dir.path()),
+                source_url: None,
+                uri: None,
+                installed_at: None,
+                updated_at: None,
+                base_layers: vec![],
+                pack: None,
+            });
+        }
+        entries
+    }
+
+    fn translate_hook_event(&self, event: &str) -> Option<String> {
+        super::hook_events::to_gemini(event)
+    }
+
+    fn read_hooks(&self) -> Vec<HookEntry> {
+        self.read_hooks_from(&self.hook_config_path())
+    }
+
+    fn read_hooks_from(&self, path: &Path) -> Vec<HookEntry> {
+        let Some(settings) = Self::parse_json(path) else {
+            return vec![];
+        };
+        let Some(hooks) = settings.get("hooks").and_then(|v| v.as_object()) else {
+            return vec![];
+        };
+        let mut entries = Vec::new();
+        for (event, hook_list) in hooks {
+            let Some(arr) = hook_list.as_array() else {
+                continue;
+            };
+            for hook in arr {
+                let matcher = hook
+                    .get("matcher")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                if let Some(cmds) = hook.get("hooks").and_then(|v| v.as_array()) {
+                    for cmd in cmds {
+                        // String format: "echo test"
+                        let cmd_str = if let Some(s) = cmd.as_str() {
+                            Some(s.to_string())
+                        }
+                        // Object format: {"type": "command", "command": "echo test"}
+                        else if let Some(s) = cmd.get("command").and_then(|v| v.as_str()) {
+                            Some(s.to_string())
+                        }
+                        // Prompt/agent hook: {"type": "prompt", "prompt": "..."}
+                        else {
+                            cmd.get("prompt")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                        };
+                        if let Some(command) = cmd_str {
+                            entries.push(HookEntry {
+                                event: event.clone(),
+                                matcher: matcher.clone(),
+                                command,
+                                enabled: true,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        entries
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_mcp_servers_splits_http_url_and_sse_url() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("settings.json");
+        std::fs::write(
+            &config,
+            r#"{"mcpServers":{
+                "streaming":{"httpUrl":"https://example.com/mcp","headers":{"Authorization":"Bearer t"}},
+                "legacy":{"url":"http://localhost:8080/sse"},
+                "fs":{"command":"npx","args":["-y","server-fs"]}
+            }}"#,
+        )
+        .unwrap();
+        let adapter = GeminiAdapter::with_home(tmp.path().to_path_buf());
+        let servers = adapter.read_mcp_servers_from(&config);
+        let by_name: std::collections::HashMap<_, _> =
+            servers.iter().map(|s| (s.name.as_str(), s)).collect();
+        assert_eq!(by_name["streaming"].transport, McpTransport::Http);
+        assert_eq!(
+            by_name["streaming"].url.as_deref(),
+            Some("https://example.com/mcp")
+        );
+        assert_eq!(by_name["streaming"].headers["Authorization"], "Bearer t");
+        assert_eq!(by_name["legacy"].transport, McpTransport::Sse);
+        assert_eq!(by_name["fs"].transport, McpTransport::Stdio);
+    }
+
+    fn setup_extension(tmp: &std::path::Path, name: &str) {
+        let ext_dir = tmp.join(".gemini").join("extensions").join(name);
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        let manifest = serde_json::json!({ "name": name, "version": "1.0.0" });
+        std::fs::write(ext_dir.join("gemini-extension.json"), manifest.to_string()).unwrap();
+    }
+
+    #[test]
+    fn read_plugins_finds_extensions() {
+        let tmp = tempfile::tempdir().unwrap();
+        setup_extension(tmp.path(), "my-ext");
+        let adapter = GeminiAdapter::with_home(tmp.path().to_path_buf());
+        let plugins = adapter.read_plugins();
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].name, "my-ext");
+        assert!(plugins[0].enabled);
+    }
+
+    #[test]
+    fn read_plugins_skips_dirs_without_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let no_manifest = tmp.path().join(".gemini").join("extensions").join("stray-dir");
+        std::fs::create_dir_all(&no_manifest).unwrap();
+        let adapter = GeminiAdapter::with_home(tmp.path().to_path_buf());
+        assert!(adapter.read_plugins().is_empty());
+    }
+
+    #[test]
+    fn read_plugins_detects_disabled_extension() {
+        let tmp = tempfile::tempdir().unwrap();
+        setup_extension(tmp.path(), "disabled-ext");
+        setup_extension(tmp.path(), "enabled-ext");
+
+        // Write enablement file with disabled-ext disabled at user scope
+        let home_str = tmp.path().to_string_lossy();
+        let enablement = serde_json::json!({
+            "disabled-ext": { "overrides": [format!("!{}/*", home_str)] },
+            "enabled-ext": { "overrides": [format!("{}/*", home_str)] },
+        });
+        let ext_dir = tmp.path().join(".gemini").join("extensions");
+        std::fs::write(
+            ext_dir.join("extension-enablement.json"),
+            enablement.to_string(),
+        ).unwrap();
+
+        let adapter = GeminiAdapter::with_home(tmp.path().to_path_buf());
+        let plugins = adapter.read_plugins();
+        assert_eq!(plugins.len(), 2);
+
+        let disabled = plugins.iter().find(|p| p.name == "disabled-ext").unwrap();
+        let enabled = plugins.iter().find(|p| p.name == "enabled-ext").unwrap();
+        assert!(!disabled.enabled);
+        assert!(enabled.enabled);
+    }
+
+    #[test]
+    fn read_plugins_defaults_enabled_when_no_enablement_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        setup_extension(tmp.path(), "some-ext");
+        // No extension-enablement.json
+        let adapter = GeminiAdapter::with_home(tmp.path().to_path_buf());
+        let plugins = adapter.read_plugins();
+        assert_eq!(plugins.len(), 1);
+        assert!(plugins[0].enabled);
+    }
+
+    #[test]
+    fn read_plugins_defaults_enabled_when_not_in_enablement_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        setup_extension(tmp.path(), "my-ext");
+
+        // Enablement file exists but doesn't mention this extension
+        let ext_dir = tmp.path().join(".gemini").join("extensions");
+        std::fs::write(
+            ext_dir.join("extension-enablement.json"),
+            r#"{"other-ext": {"overrides": ["!/some/path/*"]}}"#,
+        ).unwrap();
+
+        let adapter = GeminiAdapter::with_home(tmp.path().to_path_buf());
+        let plugins = adapter.read_plugins();
+        assert!(plugins[0].enabled);
+    }
+
+    #[test]
+    fn plugin_dirs_points_to_extensions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let adapter = GeminiAdapter::with_home(tmp.path().to_path_buf());
+        let dirs = adapter.plugin_dirs();
+        assert_eq!(dirs.len(), 1);
+        assert!(dirs[0].ends_with(".gemini/extensions"));
+    }
+
+    #[test]
+    fn read_disabled_extensions_last_matching_rule_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        setup_extension(tmp.path(), "toggled-ext");
+
+        let home_str = tmp.path().to_string_lossy();
+        // First disabled, then re-enabled at user scope — last rule wins
+        let enablement = serde_json::json!({
+            "toggled-ext": { "overrides": [
+                format!("!{}/*", home_str),
+                format!("{}/*", home_str),
+            ]}
+        });
+        let ext_dir = tmp.path().join(".gemini").join("extensions");
+        std::fs::write(
+            ext_dir.join("extension-enablement.json"),
+            enablement.to_string(),
+        ).unwrap();
+
+        let adapter = GeminiAdapter::with_home(tmp.path().to_path_buf());
+        let plugins = adapter.read_plugins();
+        assert!(plugins[0].enabled, "last rule is enable, should be enabled");
+    }
+
+    #[test]
+    fn test_gemini_subagent_methods() {
+        let tmp = tempfile::tempdir().unwrap();
+        let adapter = GeminiAdapter::with_home(tmp.path().to_path_buf());
+
+        assert!(adapter.global_subagent_files().is_empty());
+
+        let agents_dir = adapter.base_dir().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(agents_dir.join("reviewer.md"), "# reviewer").unwrap();
+        std::fs::write(agents_dir.join("notes.txt"), "ignore me").unwrap();
+
+        let subagents = adapter.global_subagent_files();
+        assert!(subagents.iter().any(|p| p.ends_with("agents/reviewer.md")));
+        assert!(
+            !subagents.iter().any(|p| p.ends_with("notes.txt")),
+            "non-.md files in agents/ must be filtered"
+        );
+
+        let settings = adapter.global_settings_files();
+        assert!(
+            !settings.iter().any(|p| p.ends_with("agents/reviewer.md")),
+            "agents/ moved to global_subagent_files; must not appear in settings"
+        );
+
+        assert_eq!(
+            adapter.project_subagent_patterns(),
+            vec![".gemini/agents/*.md".to_string()]
+        );
+    }
+}

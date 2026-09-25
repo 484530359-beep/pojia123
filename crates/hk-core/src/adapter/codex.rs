@@ -1,0 +1,804 @@
+// MCP config reference: https://developers.openai.com/codex/mcp
+// Config file: ~/.codex/config.toml
+// Format: TOML, section [mcp_servers.<name>], sub-keys: command, args, env, url, etc.
+//
+// Plugin reference: https://developers.openai.com/codex/plugins
+// Plugins: ~/.codex/plugins/cache/{marketplace}/{plugin}/{version}/, manifest at .codex-plugin/plugin.json
+
+use super::{
+    AgentAdapter, HookEntry, McpFormat, McpServerEntry, McpTransport, PluginEntry, ProjectMarker,
+    RemoteMcpSchema,
+};
+use std::path::{Path, PathBuf};
+
+/// Codex's built-in fallback order for project doc files. Matches Codex's
+/// own default per https://developers.openai.com/codex/guides/agents-md;
+/// users may shadow this list via `project_doc_fallback_filenames` in
+/// `~/.codex/config.toml`.
+const DEFAULT_DOC_FALLBACK_FILENAMES: &[&str] = &[
+    "AGENTS.override.md",
+    "AGENTS.md",
+    "TEAM_GUIDE.md",
+    ".agents.md",
+];
+
+/// Parse a `key = { "A" = "B", ... }` TOML sub-table into a string map,
+/// dropping non-string values. Used for `env` and `http_headers` blocks.
+fn toml_string_map(
+    table: Option<&toml::Table>,
+    key: &str,
+) -> std::collections::HashMap<String, String> {
+    table
+        .and_then(|t| t.get(key))
+        .and_then(|v| v.as_table())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub struct CodexAdapter {
+    home: PathBuf,
+}
+
+impl Default for CodexAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CodexAdapter {
+    pub fn new() -> Self {
+        Self {
+            home: dirs::home_dir().unwrap_or_default(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_home(home: PathBuf) -> Self {
+        Self { home }
+    }
+
+    fn parse_json(path: &Path) -> Option<serde_json::Value> {
+        let content = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str(&content).ok()
+    }
+
+    /// Resolved doc filename fallback list, in the order Codex itself searches.
+    /// Reads `project_doc_fallback_filenames` from `~/.codex/config.toml` if
+    /// the user has overridden the default; falls back to the built-in list
+    /// otherwise.
+    ///
+    /// Cases that fall back to defaults: missing file, malformed TOML, key
+    /// absent, key set to a non-array, or array that resolves to no usable
+    /// names (all empty/non-string entries). HK's role here is discovery, not
+    /// enforcement — surfacing rule files that exist on disk is more useful
+    /// than honoring a degenerate user override that hides them.
+    fn doc_fallback_filenames(&self) -> Vec<String> {
+        let override_list: Vec<String> =
+            std::fs::read_to_string(self.base_dir().join("config.toml"))
+                .ok()
+                .and_then(|content| content.parse::<toml::Table>().ok())
+                .and_then(|doc| {
+                    doc.get("project_doc_fallback_filenames")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str())
+                                .filter(|s| !s.is_empty())
+                                .map(String::from)
+                                .collect()
+                        })
+                })
+                .unwrap_or_default();
+        if override_list.is_empty() {
+            Self::default_doc_fallback_filenames()
+        } else {
+            override_list
+        }
+    }
+
+    /// The built-in fallback list as `Vec<String>` — extracted so callers
+    /// don't repeat the const-to-owned conversion.
+    fn default_doc_fallback_filenames() -> Vec<String> {
+        DEFAULT_DOC_FALLBACK_FILENAMES
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    }
+}
+
+impl AgentAdapter for CodexAdapter {
+    fn name(&self) -> &str {
+        "codex"
+    }
+    fn base_dir(&self) -> PathBuf {
+        self.home.join(".codex")
+    }
+    fn detect(&self) -> bool {
+        self.base_dir().exists()
+    }
+    fn skill_dirs(&self) -> Vec<PathBuf> {
+        // `~/.agents/skills` is the canonical user-scope path per current docs
+        // (https://developers.openai.com/codex/skills); `~/.codex/skills` is
+        // marked "Deprecated user skills location, kept for backward
+        // compatibility" in Codex's own loader source at v0.130.0
+        // (codex-rs/core-skills/src/loader.rs:293-301). Scan canonical first.
+        vec![
+            self.home.join(".agents").join("skills"),
+            self.base_dir().join("skills"),
+        ]
+    }
+    fn mcp_config_path(&self) -> PathBuf {
+        self.base_dir().join("config.toml")
+    }
+    fn mcp_format(&self) -> McpFormat {
+        McpFormat::Toml
+    }
+    fn hook_config_path(&self) -> PathBuf {
+        self.base_dir().join("hooks.json")
+    }
+    fn plugin_dirs(&self) -> Vec<PathBuf> {
+        vec![self.base_dir().join("plugins")]
+    }
+
+    fn global_rules_files(&self) -> Vec<PathBuf> {
+        // Same fallback list applies at every layer Codex searches —
+        // global (`~/.codex/`) included.
+        self.doc_fallback_filenames()
+            .into_iter()
+            .map(|name| self.base_dir().join(name))
+            .collect()
+    }
+
+    fn global_settings_files(&self) -> Vec<PathBuf> {
+        vec![
+            self.base_dir().join("config.toml"),
+            self.base_dir().join("hooks.json"),
+        ]
+    }
+
+    fn global_subagent_files(&self) -> Vec<PathBuf> {
+        // ~/.codex/agents/*.toml (Codex CLI subagents)
+        // Source: https://developers.openai.com/codex/subagents
+        super::files_with_ext(&self.base_dir().join("agents"), "toml").collect()
+    }
+
+    fn global_memory_files(&self) -> Vec<PathBuf> {
+        // ~/.codex/memories/*.md — explicit `is_file()` preserves prior
+        // semantics (rejects a hypothetical directory whose name ends in
+        // `.md`); cheap parity over a "siblings don't bother" argument.
+        //
+        // Do NOT extend this to scan ~/.codex/memories_extensions/chronicle/.
+        // Chronicle is a screen-recording research preview (opt-in,
+        // ChatGPT Pro / macOS only) whose on-disk files contain unencrypted
+        // OCR'd screen content. Surfacing those to HK's Memory section would
+        // be a privacy footgun even though the files are technically readable.
+        // Source: https://developers.openai.com/codex/memories/chronicle
+        super::files_with_ext(&self.base_dir().join("memories"), "md")
+            .filter(|p| p.is_file())
+            .collect()
+    }
+
+    fn project_markers(&self) -> Vec<ProjectMarker> {
+        vec![ProjectMarker::Dir(".codex")]
+    }
+
+    fn project_rules_patterns(&self) -> Vec<String> {
+        self.doc_fallback_filenames()
+    }
+
+    fn project_settings_patterns(&self) -> Vec<String> {
+        vec![".codex/config.toml".into()]
+    }
+
+    fn project_subagent_patterns(&self) -> Vec<String> {
+        vec![".codex/agents/*.toml".into()]
+    }
+
+    fn project_mcp_config_relpath(&self) -> Option<String> {
+        // Project-level Codex MCP servers live in the same project config
+        // file as everything else: `<repo>/.codex/config.toml`, under
+        // `[mcp_servers.<name>]` sections (same shape as the global file at
+        // `~/.codex/config.toml`). Source:
+        // https://developers.openai.com/codex/mcp
+        Some(".codex/config.toml".into())
+    }
+
+    fn project_hook_config_relpath(&self) -> Option<String> {
+        // Project-level Codex hooks live at `<repo>/.codex/hooks.json`. Codex
+        // also supports inline `[hooks]` tables in `<repo>/.codex/config.toml`
+        // — HK does not surface that form (asymmetric read/write would let
+        // users see hooks they can't redeploy). Source:
+        // https://developers.openai.com/codex/hooks
+        //
+        // Codex requires a per-project trust grant before these hooks
+        // execute; the file exists on disk regardless, so HK scans it as
+        // discovery surface independent of trust state.
+        Some(".codex/hooks.json".into())
+    }
+
+    fn project_skill_dirs(&self) -> Vec<String> {
+        // Codex CLI scans .agents/skills from cwd up to the repo root.
+        // Source: https://developers.openai.com/codex/skills
+        vec![".agents/skills".into()]
+    }
+
+    fn read_mcp_servers(&self) -> Vec<McpServerEntry> {
+        self.read_mcp_servers_from(&self.mcp_config_path())
+    }
+
+    fn read_mcp_servers_from(&self, path: &Path) -> Vec<McpServerEntry> {
+        let content = std::fs::read_to_string(path).ok();
+        let doc: Option<toml::Table> = content.and_then(|c| c.parse().ok());
+        let Some(doc) = doc else { return vec![] };
+        let Some(servers) = doc.get("mcp_servers").and_then(|v| v.as_table()) else {
+            return vec![];
+        };
+        servers
+            .iter()
+            .map(|(name, val)| {
+                let table = val.as_table();
+                // Prefer `_hk_name` (original name before TOML key sanitization)
+                // so that the scanner produces the same Extension name across all
+                // agents. Falls back to the TOML key if `_hk_name` is absent.
+                let canonical_name = table
+                    .and_then(|t| t.get("_hk_name"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| name.clone());
+                // Remote entries: url = "..." (+ http_headers = {...}) —
+                // Codex speaks Streamable HTTP only, no SSE.
+                let url = table
+                    .and_then(|t| t.get("url"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let transport = if url.is_some() {
+                    McpTransport::Http
+                } else {
+                    McpTransport::Stdio
+                };
+                McpServerEntry {
+                    name: canonical_name,
+                    command: table
+                        .and_then(|t| t.get("command"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .into(),
+                    args: table
+                        .and_then(|t| t.get("args"))
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    env: toml_string_map(table, "env"),
+                    transport,
+                    url,
+                    headers: toml_string_map(table, "http_headers"),
+                    // Codex's TOML schema has no agent-native disable concept.
+                    enabled: true,
+                }
+            })
+            .collect()
+    }
+
+    fn remote_mcp_schema(&self) -> RemoteMcpSchema {
+        RemoteMcpSchema::Toml
+    }
+
+    fn translate_hook_event(&self, event: &str) -> Option<String> {
+        super::hook_events::to_claude(event) // Codex uses same event names as Claude
+    }
+
+    fn read_hooks(&self) -> Vec<HookEntry> {
+        self.read_hooks_from(&self.hook_config_path())
+    }
+
+    fn read_hooks_from(&self, path: &Path) -> Vec<HookEntry> {
+        let Some(config) = Self::parse_json(path) else {
+            return vec![];
+        };
+        let Some(hooks) = config.get("hooks").and_then(|v| v.as_object()) else {
+            return vec![];
+        };
+        let mut entries = Vec::new();
+        for (event, hook_list) in hooks {
+            let Some(arr) = hook_list.as_array() else {
+                continue;
+            };
+            for hook in arr {
+                let matcher = hook
+                    .get("matcher")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                if let Some(cmds) = hook.get("hooks").and_then(|v| v.as_array()) {
+                    for cmd in cmds {
+                        // String format: "echo test"
+                        let cmd_str = if let Some(s) = cmd.as_str() {
+                            Some(s.to_string())
+                        }
+                        // Object format: {"type": "command", "command": "echo test"}
+                        else if let Some(s) = cmd.get("command").and_then(|v| v.as_str()) {
+                            Some(s.to_string())
+                        }
+                        // Prompt/agent hook: {"type": "prompt", "prompt": "..."}
+                        else {
+                            cmd.get("prompt")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                        };
+                        if let Some(command) = cmd_str {
+                            entries.push(HookEntry {
+                                event: event.clone(),
+                                matcher: matcher.clone(),
+                                command,
+                                enabled: true,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        entries
+    }
+
+    fn read_plugins(&self) -> Vec<PluginEntry> {
+        // Read disabled plugins from config.toml [plugins."name@source"] enabled = false
+        let disabled_plugins: std::collections::HashSet<String> =
+            std::fs::read_to_string(self.mcp_config_path())
+                .ok()
+                .and_then(|content| content.parse::<toml::Table>().ok())
+                .and_then(|doc| doc.get("plugins").and_then(|v| v.as_table()).cloned())
+                .map(|plugins| {
+                    plugins
+                        .into_iter()
+                        .filter(|(_, v)| {
+                            v.as_table()
+                                .and_then(|t| t.get("enabled"))
+                                .and_then(|e| e.as_bool())
+                                == Some(false)
+                        })
+                        .map(|(k, _)| k)
+                        .collect()
+                })
+                .unwrap_or_default();
+
+        // Codex plugins are cached at ~/.codex/plugins/cache/{marketplace}/{plugin}/{version}/
+        // Each has .codex-plugin/plugin.json manifest
+        let cache_dir = self.base_dir().join("plugins").join("cache");
+        let Ok(marketplaces) = std::fs::read_dir(&cache_dir) else {
+            return vec![];
+        };
+        let mut entries = Vec::new();
+        for marketplace in marketplaces.flatten() {
+            if !marketplace.path().is_dir() {
+                continue;
+            }
+            let marketplace_name = marketplace.file_name().to_string_lossy().to_string();
+            let Ok(plugins) = std::fs::read_dir(marketplace.path()) else {
+                continue;
+            };
+            for plugin in plugins.flatten() {
+                if !plugin.path().is_dir() {
+                    continue;
+                }
+                let plugin_name = plugin.file_name().to_string_lossy().to_string();
+                // Find the latest version directory (sorted by semver descending)
+                let Ok(versions) = std::fs::read_dir(plugin.path()) else {
+                    continue;
+                };
+                let mut version_dirs: Vec<_> =
+                    versions.flatten().filter(|v| v.path().is_dir()).collect();
+                version_dirs.sort_by(|a, b| {
+                    let va = a
+                        .file_name()
+                        .to_string_lossy()
+                        .trim_start_matches('v')
+                        .to_string();
+                    let vb = b
+                        .file_name()
+                        .to_string_lossy()
+                        .trim_start_matches('v')
+                        .to_string();
+                    match (semver::Version::parse(&va), semver::Version::parse(&vb)) {
+                        (Ok(sa), Ok(sb)) => sb.cmp(&sa),
+                        _ => b.file_name().cmp(&a.file_name()),
+                    }
+                });
+                for version_dir in version_dirs {
+                    let manifest_path =
+                        version_dir.path().join(".codex-plugin").join("plugin.json");
+                    if !manifest_path.exists() {
+                        continue;
+                    }
+                    // Read manifest for metadata
+                    let name = if let Ok(content) = std::fs::read_to_string(&manifest_path) {
+                        serde_json::from_str::<serde_json::Value>(&content)
+                            .ok()
+                            .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(String::from))
+                            .unwrap_or_else(|| plugin_name.clone())
+                    } else {
+                        plugin_name.clone()
+                    };
+                    entries.push(PluginEntry {
+                        name: name.clone(),
+                        source: marketplace_name.clone(),
+                        enabled: !disabled_plugins
+                            .contains(&format!("{}@{}", name, &marketplace_name)),
+                        path: Some(version_dir.path().to_path_buf()), // version level — matches manifest location
+                        source_url: None,
+                        uri: None,
+                        installed_at: None,
+                        updated_at: None,
+                        base_layers: vec![],
+                        pack: None,
+                    });
+                    break; // Take the latest version after sorting
+                }
+            }
+        }
+        entries
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::AgentAdapter;
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn read_mcp_servers_parses_url_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config.toml");
+        fs::write(
+            &config,
+            r#"
+[mcp_servers.figma]
+url = "https://mcp.figma.com/mcp"
+
+[mcp_servers.figma.http_headers]
+"X-Figma-Region" = "us-east-1"
+
+[mcp_servers.fs]
+command = "npx"
+args = ["-y", "srv"]
+"#,
+        )
+        .unwrap();
+        let adapter = CodexAdapter::with_home(tmp.path().to_path_buf());
+        let servers = adapter.read_mcp_servers_from(&config);
+        let figma = servers.iter().find(|s| s.name == "figma").unwrap();
+        assert_eq!(figma.transport, McpTransport::Http);
+        assert_eq!(figma.url.as_deref(), Some("https://mcp.figma.com/mcp"));
+        assert_eq!(figma.command, "");
+        assert_eq!(figma.headers["X-Figma-Region"], "us-east-1");
+        let fs_entry = servers.iter().find(|s| s.name == "fs").unwrap();
+        assert_eq!(fs_entry.transport, McpTransport::Stdio);
+    }
+
+    /// Helper: create a plugin version directory with a manifest
+    fn create_plugin_version(
+        base: &std::path::Path,
+        marketplace: &str,
+        plugin: &str,
+        version: &str,
+        manifest_name: &str,
+    ) {
+        let version_dir = base
+            .join(".codex/plugins/cache")
+            .join(marketplace)
+            .join(plugin)
+            .join(version);
+        let manifest_dir = version_dir.join(".codex-plugin");
+        fs::create_dir_all(&manifest_dir).unwrap();
+        fs::write(
+            manifest_dir.join("plugin.json"),
+            format!(r#"{{"name":"{}"}}"#, manifest_name),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn read_plugins_picks_latest_semver() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Create versions in non-sorted order: 1.9.0 then 1.10.0
+        // Lexicographic sort would wrongly pick 1.9.0 > 1.10.0
+        create_plugin_version(tmp.path(), "npm", "my-plugin", "1.9.0", "my-plugin");
+        create_plugin_version(tmp.path(), "npm", "my-plugin", "1.10.0", "my-plugin");
+        create_plugin_version(tmp.path(), "npm", "my-plugin", "1.2.0", "my-plugin");
+
+        let adapter = CodexAdapter::with_home(tmp.path().to_path_buf());
+        let plugins = adapter.read_plugins();
+
+        assert_eq!(plugins.len(), 1);
+        // The path should end with 1.10.0, not 1.9.0
+        let path_str = plugins[0]
+            .path
+            .as_ref()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            path_str.ends_with("1.10.0"),
+            "Expected 1.10.0 but got path: {}",
+            path_str
+        );
+    }
+
+    #[test]
+    fn read_plugins_handles_v_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_plugin_version(tmp.path(), "npm", "tool", "v2.0.0", "tool");
+        create_plugin_version(tmp.path(), "npm", "tool", "v1.5.0", "tool");
+
+        let adapter = CodexAdapter::with_home(tmp.path().to_path_buf());
+        let plugins = adapter.read_plugins();
+
+        assert_eq!(plugins.len(), 1);
+        let path_str = plugins[0]
+            .path
+            .as_ref()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            path_str.contains("v2.0.0"),
+            "Expected v2.0.0 but got: {}",
+            path_str
+        );
+    }
+
+    #[test]
+    fn read_plugins_returns_one_entry_per_plugin() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_plugin_version(tmp.path(), "npm", "alpha", "1.0.0", "alpha");
+        create_plugin_version(tmp.path(), "npm", "alpha", "2.0.0", "alpha");
+        create_plugin_version(tmp.path(), "npm", "alpha", "3.0.0", "alpha");
+
+        let adapter = CodexAdapter::with_home(tmp.path().to_path_buf());
+        let plugins = adapter.read_plugins();
+
+        // Should return exactly 1 entry (latest), not 3
+        assert_eq!(
+            plugins.len(),
+            1,
+            "Expected 1 plugin entry, got {}",
+            plugins.len()
+        );
+    }
+
+    #[test]
+    fn delete_plugin_parent_removes_all_versions() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_plugin_version(tmp.path(), "npm", "doomed", "1.0.0", "doomed");
+        create_plugin_version(tmp.path(), "npm", "doomed", "2.0.0", "doomed");
+        create_plugin_version(tmp.path(), "npm", "doomed", "3.0.0", "doomed");
+
+        let adapter = CodexAdapter::with_home(tmp.path().to_path_buf());
+        let plugins = adapter.read_plugins();
+        assert_eq!(plugins.len(), 1);
+
+        // Simulate what commands.rs does for codex adapter: delete parent of version dir
+        let version_path = plugins[0].path.as_ref().unwrap();
+        let plugin_dir = version_path.parent().unwrap();
+        assert!(plugin_dir.file_name().unwrap() == "doomed");
+        fs::remove_dir_all(plugin_dir).unwrap();
+
+        // After deletion, no plugins should be found
+        let plugins_after = adapter.read_plugins();
+        assert_eq!(
+            plugins_after.len(),
+            0,
+            "Plugin should not come back after deleting parent dir"
+        );
+    }
+
+    #[test]
+    fn read_plugins_empty_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No .codex directory at all
+        let adapter = CodexAdapter::with_home(tmp.path().to_path_buf());
+        let plugins = adapter.read_plugins();
+        assert!(plugins.is_empty());
+    }
+
+    #[test]
+    fn read_plugins_respects_config_toml_enabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let adapter = CodexAdapter::with_home(tmp.path().to_path_buf());
+
+        // Set up a plugin in cache
+        let plugin_dir = tmp
+            .path()
+            .join(".codex/plugins/cache/test-marketplace/my-plugin/1.0.0/.codex-plugin");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::write(plugin_dir.join("plugin.json"), r#"{"name":"my-plugin"}"#).unwrap();
+
+        // No config.toml → plugin should be enabled (default)
+        let entries = adapter.read_plugins();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].enabled);
+
+        // config.toml with plugin disabled
+        let config_path = tmp.path().join(".codex/config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[plugins."my-plugin@test-marketplace"]
+enabled = false
+"#,
+        )
+        .unwrap();
+
+        let entries = adapter.read_plugins();
+        assert_eq!(entries.len(), 1);
+        assert!(
+            !entries[0].enabled,
+            "Plugin should be disabled per config.toml"
+        );
+    }
+
+    #[test]
+    fn read_hooks_object_format() {
+        let tmp = tempfile::tempdir().unwrap();
+        let codex_dir = tmp.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        fs::write(codex_dir.join("hooks.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"echo test"}]}]}}"#
+        ).unwrap();
+        let adapter = CodexAdapter::with_home(tmp.path().to_path_buf());
+        let hooks = adapter.read_hooks();
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0].event, "PreToolUse");
+        assert_eq!(hooks[0].command, "echo test");
+    }
+
+    #[test]
+    fn test_codex_subagent_methods() {
+        let tmp = tempfile::tempdir().unwrap();
+        let adapter = CodexAdapter::with_home(tmp.path().to_path_buf());
+
+        // Missing agents/ dir → empty.
+        assert!(adapter.global_subagent_files().is_empty());
+
+        // Codex subagents are TOML, not Markdown.
+        // Source: https://developers.openai.com/codex/subagents
+        let agents_dir = adapter.base_dir().join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        fs::write(agents_dir.join("reviewer.toml"), "name = \"reviewer\"").unwrap();
+        fs::write(agents_dir.join("notes.md"), "ignore — wrong ext").unwrap();
+
+        let subagents = adapter.global_subagent_files();
+        assert!(
+            subagents
+                .iter()
+                .any(|p| p.ends_with("agents/reviewer.toml"))
+        );
+        assert!(
+            !subagents.iter().any(|p| p.ends_with("notes.md")),
+            ".md files in Codex agents/ must be filtered (Codex uses .toml)"
+        );
+
+        assert_eq!(
+            adapter.project_subagent_patterns(),
+            vec![".codex/agents/*.toml".to_string()]
+        );
+    }
+
+    #[test]
+    fn doc_fallback_returns_default_when_config_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let adapter = CodexAdapter::with_home(tmp.path().to_path_buf());
+        assert_eq!(
+            adapter.doc_fallback_filenames(),
+            vec![
+                "AGENTS.override.md",
+                "AGENTS.md",
+                "TEAM_GUIDE.md",
+                ".agents.md"
+            ]
+        );
+    }
+
+    #[test]
+    fn doc_fallback_returns_default_when_key_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let codex_dir = tmp.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        fs::write(codex_dir.join("config.toml"), "[features]\nhooks = true\n").unwrap();
+        let adapter = CodexAdapter::with_home(tmp.path().to_path_buf());
+        assert_eq!(adapter.doc_fallback_filenames().len(), 4);
+        assert_eq!(adapter.doc_fallback_filenames()[0], "AGENTS.override.md");
+    }
+
+    #[test]
+    fn doc_fallback_honors_user_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let codex_dir = tmp.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        fs::write(
+            codex_dir.join("config.toml"),
+            r#"project_doc_fallback_filenames = ["MY_GUIDE.md", "AGENTS.md"]"#,
+        )
+        .unwrap();
+        let adapter = CodexAdapter::with_home(tmp.path().to_path_buf());
+        assert_eq!(
+            adapter.doc_fallback_filenames(),
+            vec!["MY_GUIDE.md", "AGENTS.md"]
+        );
+    }
+
+    #[test]
+    fn doc_fallback_treats_empty_array_as_no_override() {
+        // HK is a discovery tool: an explicit empty list would suppress all
+        // rule-file detection, hiding files that genuinely exist on disk.
+        // Fall through to defaults so Codex's auto-injection preference
+        // doesn't blind HK's UI.
+        let tmp = tempfile::tempdir().unwrap();
+        let codex_dir = tmp.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        fs::write(
+            codex_dir.join("config.toml"),
+            "project_doc_fallback_filenames = []",
+        )
+        .unwrap();
+        let adapter = CodexAdapter::with_home(tmp.path().to_path_buf());
+        assert_eq!(adapter.doc_fallback_filenames().len(), 4);
+    }
+
+    #[test]
+    fn doc_fallback_drops_empty_string_entries() {
+        // `base_dir().join("")` resolves to base_dir itself (a directory),
+        // which would surface as a bogus "rule file" candidate.
+        let tmp = tempfile::tempdir().unwrap();
+        let codex_dir = tmp.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        fs::write(
+            codex_dir.join("config.toml"),
+            r#"project_doc_fallback_filenames = ["", "GUIDE.md", ""]"#,
+        )
+        .unwrap();
+        let adapter = CodexAdapter::with_home(tmp.path().to_path_buf());
+        assert_eq!(adapter.doc_fallback_filenames(), vec!["GUIDE.md"]);
+    }
+
+    #[test]
+    fn doc_fallback_silently_falls_back_on_corrupted_toml() {
+        // Mirror Codex's own behavior: a malformed config doesn't break
+        // file discovery; we just use the built-in defaults.
+        let tmp = tempfile::tempdir().unwrap();
+        let codex_dir = tmp.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        fs::write(codex_dir.join("config.toml"), "this is not valid TOML [[[").unwrap();
+        let adapter = CodexAdapter::with_home(tmp.path().to_path_buf());
+        assert_eq!(adapter.doc_fallback_filenames().len(), 4);
+    }
+
+    #[test]
+    fn global_and_project_rules_use_resolved_fallback() {
+        // The resolved list flows into BOTH global_rules_files and
+        // project_rules_patterns — same config, every layer Codex searches.
+        let tmp = tempfile::tempdir().unwrap();
+        let codex_dir = tmp.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        fs::write(
+            codex_dir.join("config.toml"),
+            r#"project_doc_fallback_filenames = ["A.md", "B.md"]"#,
+        )
+        .unwrap();
+        let adapter = CodexAdapter::with_home(tmp.path().to_path_buf());
+
+        let globals = adapter.global_rules_files();
+        assert_eq!(globals.len(), 2);
+        assert!(globals[0].ends_with(".codex/A.md"));
+        assert!(globals[1].ends_with(".codex/B.md"));
+
+        assert_eq!(adapter.project_rules_patterns(), vec!["A.md", "B.md"]);
+    }
+}
