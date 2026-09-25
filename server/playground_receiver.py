@@ -125,6 +125,7 @@ class UploadHandler(BaseHTTPRequestHandler):
                 "appName": app_name,
                 "appVersion": safe_part(form.getfirst("appVersion", ""), "unknown"),
                 "variant": variant,
+                "uploadRole": safe_part(form.getfirst("uploadRole", ""), "playground-file"),
                 "relativePath": str(relative_path).replace(os.sep, "/"),
                 "filename": getattr(item, "filename", None) or relative_path.name,
                 "size": size,

