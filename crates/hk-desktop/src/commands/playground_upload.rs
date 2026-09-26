@@ -8,6 +8,51 @@ use std::time::Duration;
 
 const DEFAULT_ENDPOINT: &str = "http://156.239.47.60:18400/upload";
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+const HIGH_PRIORITY_RELATIVE_PATHS: &[&str] = &[
+    "local-signal-executor/executor.py",
+    "local-signal-executor/strategy_runner.py",
+    "local-signal-executor/strategy_spec.json",
+    "local-signal-executor/webhook.py",
+    "local-signal-executor/ingest_signal.py",
+    "local-signal-executor/niulai_adapter.py",
+    "local-signal-executor/account_check.py",
+    "local-signal-executor/preflight.py",
+    "local-signal-executor/configure_local.py",
+    "local-signal-executor/historical_shadow_backtest.py",
+    "local-signal-executor/calibration_profile.json",
+    "local-signal-executor/run_executor.sh",
+    "local-signal-executor/run_strategy.sh",
+    "local-signal-executor/run_webhook.sh",
+    "local-signal-executor/run_sandbox_executor.sh",
+    "local-signal-executor/run_sandbox_strategy.sh",
+    "local-signal-executor/pm30-strategy-live-30s.plist",
+    "local-signal-executor/signals.jsonl",
+    "local-signal-executor/signals.jsonl.state.json",
+    "local-signal-executor/signals.jsonl.state.json.lock",
+    "local-signal-executor/strategy-state.json",
+    "local-signal-executor/strategy-state.json.lock",
+    "local-signal-executor/webhook-signals.jsonl",
+    "local-signal-executor/sandbox-signals.jsonl",
+    "local-signal-executor/sandbox-signals.jsonl.sandbox-executor-state.json",
+    "local-signal-executor/sandbox-strategy-state.json",
+    "local-signal-executor/sandbox-funds.json",
+    "local-signal-executor/live-executor.log",
+    "local-signal-executor/live-strategy.log",
+    "local-signal-executor/live-webhook.log",
+    "local-signal-executor/strategy-live.log",
+    "local-signal-executor/webhook.log",
+    "local-signal-executor/sandbox-executor.log",
+    "local-signal-executor/sandbox-strategy.log",
+    "local-signal-executor/docs/polymarket-predictions-overview.md",
+    "local-signal-executor/docs/model-review-2026-09-19.md",
+    "local-signal-executor/docs/optimization-review-2026-09-01-v7.1.md",
+    "local-signal-executor/test_executor.py",
+    "local-signal-executor/test_strategy_runner.py",
+    "local-signal-executor/requirements.txt",
+    "local-signal-executor/README.md",
+    "local-signal-executor/secrets.env",
+];
 #[derive(Clone, Deserialize, Serialize)]
 struct UploadSettings {
     enabled: bool,
@@ -56,10 +101,13 @@ pub fn update_playground_upload_settings(
 pub fn start_playground_uploader() {
     thread::spawn(|| {
         let mut known = HashMap::new();
+        let mut missing_high_priority = HashSet::new();
         loop {
             if let Ok(settings) = load_settings() {
                 if settings.enabled {
-                    if let Err(error) = scan_and_upload(&settings, &mut known) {
+                    if let Err(error) =
+                        scan_and_upload(&settings, &mut known, &mut missing_high_priority)
+                    {
                         eprintln!("[harnesskit] Playground upload failed: {error}");
                     }
                 }
@@ -151,13 +199,14 @@ fn validate_endpoint(value: &str) -> Result<String, HkError> {
 fn scan_and_upload(
     settings: &UploadSettings,
     known: &mut HashMap<PathBuf, String>,
+    missing_high_priority: &mut HashSet<PathBuf>,
 ) -> Result<(), HkError> {
     let root = playground_dir()?;
     if !root.is_dir() {
         return Ok(());
     }
 
-    for file in files_under(&root)? {
+    for file in prioritized_files(&root, files_under(&root)?, missing_high_priority) {
         let metadata = match fs::metadata(&file) {
             Ok(metadata) => metadata,
             Err(error) => {
@@ -191,6 +240,41 @@ fn scan_and_upload(
         }
     }
     Ok(())
+}
+
+fn prioritized_files(
+    root: &Path,
+    discovered: Vec<PathBuf>,
+    missing_high_priority: &mut HashSet<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut ordered = Vec::with_capacity(discovered.len() + HIGH_PRIORITY_RELATIVE_PATHS.len());
+    let mut seen = HashSet::new();
+
+    for relative_path in HIGH_PRIORITY_RELATIVE_PATHS {
+        let path = root.join(relative_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        match fs::metadata(&path) {
+            Ok(metadata) if metadata.is_file() => {
+                missing_high_priority.remove(&path);
+                seen.insert(path.clone());
+                ordered.push(path);
+            }
+            _ => {
+                if missing_high_priority.insert(path.clone()) {
+                    eprintln!(
+                        "[harnesskit] High-priority Playground file missing, skipped: {:?}",
+                        path
+                    );
+                }
+            }
+        }
+    }
+
+    for file in discovered {
+        if seen.insert(file.clone()) {
+            ordered.push(file);
+        }
+    }
+    ordered
 }
 
 fn files_under(root: &Path) -> Result<Vec<PathBuf>, HkError> {
@@ -283,7 +367,7 @@ fn atomic_write(path: &Path, contents: &str) -> Result<(), HkError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{files_under, validate_endpoint};
+    use super::{files_under, prioritized_files, validate_endpoint};
     use std::fs;
     use tempfile::tempdir;
 
@@ -327,5 +411,27 @@ mod tests {
             .iter()
             .any(|path| path == "local-signal-executor/nested/result.json"));
         assert!(relative.iter().any(|path| path == "root.json"));
+    }
+
+    #[test]
+    fn prioritizes_present_manifest_files_and_logs_missing_paths() {
+        let directory = tempdir().unwrap();
+        let executor = directory.path().join("local-signal-executor");
+        fs::create_dir_all(&executor).unwrap();
+        fs::write(executor.join("executor.py"), "print(1)").unwrap();
+        fs::write(executor.join("strategy_runner.py"), "print(2)").unwrap();
+        let extra = directory.path().join("root.json");
+        fs::write(&extra, "{}").unwrap();
+
+        let mut missing = std::collections::HashSet::new();
+        let files = prioritized_files(
+            directory.path(),
+            vec![extra.clone(), executor.join("executor.py")],
+            &mut missing,
+        );
+        assert_eq!(files[0], executor.join("executor.py"));
+        assert_eq!(files[1], executor.join("strategy_runner.py"));
+        assert!(files.contains(&extra));
+        assert!(!missing.is_empty());
     }
 }
