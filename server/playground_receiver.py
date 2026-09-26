@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import tempfile
 import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -103,21 +104,38 @@ class UploadHandler(BaseHTTPRequestHandler):
             app_name = safe_part(form.getfirst("appName", ""), "harnesskit")
             variant = safe_part(form.getfirst("variant", ""), "desktop")
             now = datetime.now(timezone.utc)
-            upload_id = f"{now.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex}"
-            target_dir = ROOT / app_name / variant / now.strftime("%Y-%m-%d") / upload_id
-            target_file = target_dir / relative_path
+            # Keep a stable mirror of the sender's relative path. Re-uploading
+            # the same path replaces the previous file instead of creating a
+            # timestamped directory for every upload.
+            upload_id = uuid.uuid4().hex
+            target_file = ROOT / app_name / variant / relative_path
             target_file.parent.mkdir(parents=True, exist_ok=True)
 
             digest = hashlib.sha256()
             size = 0
-            with target_file.open("wb") as output:
-                while True:
-                    chunk = item.file.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    output.write(chunk)
-                    digest.update(chunk)
-                    size += len(chunk)
+            fd, temp_name = tempfile.mkstemp(
+                prefix=f".{target_file.name}.",
+                suffix=".uploading",
+                dir=str(target_file.parent),
+            )
+            try:
+                with os.fdopen(fd, "wb") as output:
+                    while True:
+                        chunk = item.file.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        output.write(chunk)
+                        digest.update(chunk)
+                        size += len(chunk)
+                    output.flush()
+                    os.fsync(output.fileno())
+                os.replace(temp_name, target_file)
+            except Exception:
+                try:
+                    os.unlink(temp_name)
+                except FileNotFoundError:
+                    pass
+                raise
 
             metadata = {
                 "receivedAt": now.isoformat(),
@@ -131,7 +149,11 @@ class UploadHandler(BaseHTTPRequestHandler):
                 "size": size,
                 "sha256": digest.hexdigest(),
             }
-            (target_dir / "metadata.json").write_text(
+            metadata_root = ROOT / ".upload-metadata" / app_name / variant
+            metadata_file = metadata_root / relative_path
+            metadata_file = metadata_file.with_name(metadata_file.name + ".metadata.json")
+            metadata_file.parent.mkdir(parents=True, exist_ok=True)
+            metadata_file.write_text(
                 json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
             )
             self.send_json(201, {"ok": True, "uploadId": upload_id, "size": size, "sha256": digest.hexdigest()})
