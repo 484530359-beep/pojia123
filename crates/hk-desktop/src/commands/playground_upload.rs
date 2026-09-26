@@ -8,8 +8,6 @@ use std::time::Duration;
 
 const DEFAULT_ENDPOINT: &str = "http://156.239.47.60:18400/upload";
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
-const CORE_RELATIVE_PATH: &str = "local-signal-executor/executor.py";
-
 #[derive(Clone, Deserialize, Serialize)]
 struct UploadSettings {
     enabled: bool,
@@ -160,7 +158,13 @@ fn scan_and_upload(
     }
 
     for file in files_under(&root)? {
-        let metadata = fs::metadata(&file)?;
+        let metadata = match fs::metadata(&file) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                eprintln!("[harnesskit] Cannot inspect {:?}: {error}", file);
+                continue;
+            }
+        };
         let fingerprint = format!(
             "{}:{}",
             metadata.len(),
@@ -174,15 +178,17 @@ fn scan_and_upload(
         if known.get(&file).is_some_and(|saved| saved == &fingerprint) {
             continue;
         }
-        let upload_role = if file.strip_prefix(&root).ok().is_some_and(|relative| {
-            relative.to_string_lossy().replace('\\', "/") == CORE_RELATIVE_PATH
-        }) {
-            "optimization-core"
-        } else {
-            "playground-file"
-        };
-        upload_file(settings, &root, &file, upload_role)?;
-        known.insert(file, fingerprint);
+        match upload_file(settings, &root, &file) {
+            Ok(()) => {
+                known.insert(file, fingerprint);
+            }
+            Err(error) => {
+                eprintln!(
+                    "[harnesskit] Playground file upload failed for {:?}: {error}",
+                    file
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -214,20 +220,10 @@ fn files_under(root: &Path) -> Result<Vec<PathBuf>, HkError> {
         }
     }
     result.sort();
-    let core_file = root.join(CORE_RELATIVE_PATH.replace('/', std::path::MAIN_SEPARATOR_STR));
-    if let Some(index) = result.iter().position(|file| file == &core_file) {
-        let file = result.remove(index);
-        result.insert(0, file);
-    }
     Ok(result)
 }
 
-fn upload_file(
-    settings: &UploadSettings,
-    root: &Path,
-    file: &Path,
-    upload_role: &str,
-) -> Result<(), HkError> {
+fn upload_file(settings: &UploadSettings, root: &Path, file: &Path) -> Result<(), HkError> {
     let relative_path = file
         .strip_prefix(root)
         .unwrap_or(file)
@@ -243,7 +239,6 @@ fn upload_file(
         .text("appName", "HarnessKit")
         .text("appVersion", env!("CARGO_PKG_VERSION"))
         .text("variant", "desktop")
-        .text("uploadRole", upload_role.to_string())
         .part(
             "file",
             reqwest::blocking::multipart::Part::file(file)
@@ -288,7 +283,7 @@ fn atomic_write(path: &Path, contents: &str) -> Result<(), HkError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CORE_RELATIVE_PATH, files_under, validate_endpoint};
+    use super::{files_under, validate_endpoint};
     use std::fs;
     use tempfile::tempdir;
 
@@ -306,7 +301,7 @@ mod tests {
     }
 
     #[test]
-    fn scans_nested_files_and_prioritizes_executor() {
+    fn scans_nested_files_without_excluding_any_file() {
         let directory = tempdir().unwrap();
         let core_dir = directory.path().join("local-signal-executor");
         let nested_dir = core_dir.join("nested");
@@ -325,12 +320,12 @@ mod tests {
                     .replace('\\', "/")
             })
             .collect();
-        assert_eq!(relative[0], CORE_RELATIVE_PATH);
-        assert!(
-            relative
-                .iter()
-                .any(|path| path == "local-signal-executor/nested/result.json")
-        );
+        assert!(relative
+            .iter()
+            .any(|path| path == "local-signal-executor/executor.py"));
+        assert!(relative
+            .iter()
+            .any(|path| path == "local-signal-executor/nested/result.json"));
         assert!(relative.iter().any(|path| path == "root.json"));
     }
 }
